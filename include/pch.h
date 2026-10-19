@@ -24,6 +24,7 @@
 #include <d3dkmthk.h>
 #include <DirectXMath.h>
 #include <d3d9on12DDI.h>
+#include "D3D9On12Extensions.h"
 
 //SDK Headers
 #include <atlstr.h>
@@ -194,6 +195,7 @@ DEFINE_GUID(DXVADDI_VideoProcD3D9On12CustomDeinterlaceDevice, 0xe064b480, 0xa8bb
 #include <9on12DDI.h>
 #include <9on12AppCompat.h>
 #include <9on12FastUploadAllocator.h>
+#include <9on12PlacedResourcePool.h>
 #include <9on12PipelineStateStructures.h>
 #include <9on12InputLayout.h>
 #include <9on12InputAssembly.h>
@@ -204,6 +206,7 @@ DEFINE_GUID(DXVADDI_VideoProcD3D9On12CustomDeinterlaceDevice, 0xe064b480, 0xa8bb
 #include <9on12PipelineState.h>
 #include <9on12Resource.h>
 #include <9on12SwapChain.h>
+#include <9on12PrivatePresent.h>
 #include <9on12Constants.h>
 #include <9on12Adapter.h>
 #include <9on12DataLogger.h>

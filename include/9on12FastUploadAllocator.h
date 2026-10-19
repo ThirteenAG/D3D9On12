@@ -1,6 +1,9 @@
 ﻿// Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 #pragma once
+#include <array>
+#include <atomic>
+#include <mutex>
 
 namespace D3D9on12
 {
@@ -25,7 +28,7 @@ namespace D3D9on12
         };
 
         FastUploadAllocator(Device& device, UINT size, UINT alignment, bool bDeferDestroyDuringRealloc = false);
-        ~FastUploadAllocator() = default;
+        ~FastUploadAllocator();
 
         SubBuffer Allocate(UINT size);
         void Destroy();
@@ -33,6 +36,20 @@ namespace D3D9on12
 
     private:
         void Realloc();
+        void RetireArena(D3D12TranslationLayer::Resource* resource, void* mapped);
+        unique_unbind_resourceptr TakeRetiredArena();
+        struct RetiredArena
+        {
+            D3D12TranslationLayer::Resource* resource = nullptr;
+            UINT64 size = 0;
+            void* mapped = nullptr;
+            std::array<UINT64, (UINT)D3D12TranslationLayer::COMMAND_LIST_TYPE::MAX_VALID> fences{};
+        };
+        std::array<RetiredArena, 2> m_retiredArenas{};
+        std::mutex m_retiredMutex;
+        std::atomic<UINT> m_pendingRetirements{0};
+        const bool m_reuseArenas;
+
 
         Device& m_parentDevice;
         const bool m_bDeferDestroyDuringRealloc;

@@ -78,7 +78,7 @@ namespace D3D9on12
             RETURN_E_INVALIDARG_AND_CHECK();
         }
 
-        delete(pQuery);
+        Query::DestroyOrdered(*pDevice, pQuery);
 
         D3D9on12_DDI_ENTRYPOINT_END_AND_RETURN_HR(S_OK);
     }
@@ -98,7 +98,8 @@ namespace D3D9on12
             RETURN_E_INVALIDARG_AND_CHECK();
         }
 
-        HRESULT hr = pQuery->Issue(*pDevice, pIssueQuery->Flags);
+        HRESULT hr;
+            hr = pQuery->Issue(*pDevice, pIssueQuery->Flags);
 
         D3D9on12_DDI_ENTRYPOINT_END_AND_RETURN_HR(hr);
     }
@@ -118,7 +119,8 @@ namespace D3D9on12
             RETURN_E_INVALIDARG_AND_CHECK();
         }
 
-        HRESULT hr = pQuery->GetData(*pDevice, pGetQueryData->pData);
+        HRESULT hr;
+            hr = pQuery->GetData(*pDevice, pGetQueryData->pData);
         D3D9on12_DDI_ENTRYPOINT_END_AND_RETURN_HR(hr);
     }
 
@@ -128,6 +130,39 @@ namespace D3D9on12
         m_pUnderlyingQuery(nullptr)
     {};
 
+
+    Query::~Query()
+    {
+        // D3D9 permits releasing a query before End. Close its GPU scope before
+        // the translation-layer query removes itself from the active list.
+        if (m_pUnderlyingQuery &&
+            m_pUnderlyingQuery->m_CurrentState == D3D12TranslationLayer::Async::AsyncState::Begun)
+        {
+            m_pUnderlyingQuery->End();
+        }
+    }
+
+    void Query::DestroyOrdered(Device& device, Query* query)
+    {
+        // Ownership is declared before the guard so the mutex is unlocked before the
+        // object containing it is destroyed. The runtime owns hQuery lifetime.
+        std::unique_ptr<Query> owned(query);
+#if defined(D3D9ON12_BATCHED_RENDERING)
+        std::lock_guard<std::mutex> lock(query->m_operationMutex);
+        device.GetContextForDestruction();
+#else
+        UNREFERENCED_PARAMETER(device);
+#endif
+        if (query->m_pUnderlyingQuery &&
+            query->m_pUnderlyingQuery->m_CurrentState == D3D12TranslationLayer::Async::AsyncState::Begun)
+        {
+            query->m_pUnderlyingQuery->End();
+        }
+#if defined(D3D9ON12_BATCHED_RENDERING)
+        query->m_pBatchedQuery.reset();
+#endif
+        query->m_pUnderlyingQuery.reset();
+    }
 
     HRESULT Query::Init(Device& device)
     {
@@ -155,13 +190,34 @@ namespace D3D9on12
         if (m_pUnderlyingQuery)
         {
             m_pUnderlyingQuery->Initialize();
+#if defined(D3D9ON12_BATCHED_RENDERING)
+            if (auto* batch = device.GetBatchedContext())
+            {
+                m_pBatchedQuery.reset(new D3D12TranslationLayer::BatchedQuery(*batch, m_pUnderlyingQuery.get(), false));
+            }
+#endif
         }
 
         return hr;
     }
 
-    HRESULT Query::Issue(Device& /*device*/, D3DDDI_ISSUEQUERYFLAGS flags)
+    HRESULT Query::Issue(Device& device, D3DDDI_ISSUEQUERYFLAGS flags)
     {
+#if defined(D3D9ON12_BATCHED_RENDERING)
+        std::lock_guard<std::mutex> lock(m_operationMutex);
+        if (m_pBatchedQuery)
+        {
+            device.CheckBatchError();
+            auto* batch = device.GetBatchedContext();
+            if (flags.Begin) batch->QueryBegin(m_pBatchedQuery.get());
+            else if (flags.End) batch->QueryEnd(m_pBatchedQuery.get());
+            else Check9on12(false);
+            device.CheckBatchError();
+            return S_OK;
+        }
+#else
+        UNREFERENCED_PARAMETER(device);
+#endif
         HRESULT hr = S_OK;
 
         switch (m_type)
@@ -207,8 +263,29 @@ namespace D3D9on12
         return hr;
     }
 
-    HRESULT Query::GetData(Device& /*device*/, VOID* pData)
+    bool Query::GetUnderlyingData(Device& device, void* data, UINT size)
     {
+#if defined(D3D9ON12_BATCHED_RENDERING)
+        if (m_pBatchedQuery)
+        {
+            device.CheckBatchError();
+            // D3D9 DoNotFlush semantics are preserved: the runtime's FLUSH flag arrives
+            // through the Flush DDI, polling must not drain the worker here.
+            bool ready = device.GetBatchedContext()->QueryGetData(m_pBatchedQuery.get(), data, size, true);
+            device.CheckBatchError();
+            return ready;
+        }
+#else
+        UNREFERENCED_PARAMETER(device);
+#endif
+        return m_pUnderlyingQuery->GetData(data, size, true, false);
+    }
+
+    HRESULT Query::GetData(Device& device, VOID* pData)
+    {
+#if defined(D3D9ON12_BATCHED_RENDERING)
+        std::lock_guard<std::mutex> lock(m_operationMutex);
+#endif
         HRESULT hr = S_FALSE;
 
         switch (m_type)
@@ -217,7 +294,7 @@ namespace D3D9on12
         {
             BOOL finished = false;
 
-            if (m_pUnderlyingQuery->GetData(&finished, sizeof(finished), true, false))
+            if (GetUnderlyingData(device, &finished, sizeof(finished)))
             {
                 *reinterpret_cast<BOOL*>(pData) = finished;
                 return S_OK;
@@ -230,7 +307,7 @@ namespace D3D9on12
         case D3DDDIQUERYTYPE_OCCLUSION:
         {
             UINT64 occluded = 0;
-            if (m_pUnderlyingQuery->GetData(&occluded, sizeof(occluded), true, false))
+            if (GetUnderlyingData(device, &occluded, sizeof(occluded)))
             {
                 *reinterpret_cast<DWORD*>(pData) = DWORD(occluded);
                 return S_OK;
@@ -243,7 +320,7 @@ namespace D3D9on12
         case D3DDDIQUERYTYPE_TIMESTAMP:
         {
             UINT64 timestamp = 0;
-            if (m_pUnderlyingQuery->GetData(&timestamp, sizeof(timestamp), true, false))
+            if (GetUnderlyingData(device, &timestamp, sizeof(timestamp)))
             {
                 *reinterpret_cast<DWORD*>(pData) = DWORD(timestamp);
                 return S_OK;
@@ -257,7 +334,7 @@ namespace D3D9on12
         case D3DDDIQUERYTYPE_TIMESTAMPDISJOINT:
         {
             D3D12TranslationLayer::QUERY_DATA_TIMESTAMP_DISJOINT disjointResult = {};
-            if (m_pUnderlyingQuery->GetData(&disjointResult, sizeof(disjointResult), true, false))
+            if (GetUnderlyingData(device, &disjointResult, sizeof(disjointResult)))
             {
                 BOOL isDisjoint = disjointResult.Disjoint;
                 if (m_type == D3DDDIQUERYTYPE_TIMESTAMPDISJOINT)

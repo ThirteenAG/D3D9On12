@@ -107,12 +107,12 @@ namespace D3D9on12
     {
         if (m_scissorTestEnabled)
         {
-            device.GetContext().SetScissorRect(0, &m_scissorRect);
-            device.GetContext().SetScissorRectEnable(true);
+            device.GetRenderContext().SetScissorRect(0, &m_scissorRect);
+            device.GetRenderContext().SetScissorRectEnable(true);
         }
         else
         {
-            device.GetContext().SetScissorRectEnable(false);
+            device.GetRenderContext().SetScissorRectEnable(false);
         }
     }
 
@@ -193,7 +193,7 @@ namespace D3D9on12
             -2.0f / m_currentViewPort.Height,
             1.0f / (m_currentViewPort.MaxDepth - m_currentViewPort.MinDepth));
 
-        device.GetContext().SetViewport(0, &m_currentViewPort);
+        device.GetRenderContext().SetViewport(0, &m_currentViewPort);
 
         m_dirtyFlags.VSExtension = true;
     }

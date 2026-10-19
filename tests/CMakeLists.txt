@@ -1,0 +1,31 @@
+add_executable(d3d9on12_runtime_probe runtime_probe.cpp)
+target_link_libraries(d3d9on12_runtime_probe PRIVATE user32)
+add_executable(d3d9on12_sampler_probe sampler_probe.cpp)
+target_link_libraries(d3d9on12_sampler_probe PRIVATE user32 d3dcompiler d3d12)
+target_include_directories(d3d9on12_runtime_probe PRIVATE ../include)
+add_executable(d3d9on12_multistream_probe multistream_probe.cpp)
+target_link_libraries(d3d9on12_multistream_probe PRIVATE user32 d3dcompiler d3d12)
+add_executable(d3d9on12_query_order_probe query_order_probe.cpp)
+target_link_libraries(d3d9on12_query_order_probe PRIVATE user32 d3d12)
+
+add_executable(d3d9on12_multithread_reset_probe multithread_reset_probe.cpp)
+target_link_libraries(d3d9on12_multithread_reset_probe PRIVATE user32 d3d12)
+
+add_executable(d3d9on12_smaa_pass_probe smaa_pass_probe.cpp)
+target_link_libraries(d3d9on12_smaa_pass_probe PRIVATE user32 d3d12)
+
+add_executable(d3d9on12_per_draw_probe per_draw_probe.cpp)
+target_link_libraries(d3d9on12_per_draw_probe PRIVATE user32 d3dcompiler d3d12)
+
+# CPU reference model checks whole/partial mip, array and plane view bookkeeping.
+add_executable(d3d9on12_binding_state_probe binding_state_probe.cpp)
+target_link_libraries(d3d9on12_binding_state_probe PRIVATE d3d12translationlayer)
+add_executable(d3d9on12_upload_pool_probe upload_pool_probe.cpp)
+target_link_libraries(d3d9on12_upload_pool_probe PRIVATE d3d12translationlayer)
+
+add_executable(d3d9on12_latency_probe latency_probe.cpp)
+target_include_directories(d3d9on12_latency_probe PRIVATE ../include)
+target_link_libraries(d3d9on12_latency_probe PRIVATE user32 d3d12)
+
+add_executable(d3d9on12_allocation_info_probe allocation_info_probe.cpp)
+target_link_libraries(d3d9on12_allocation_info_probe PRIVATE d3d12)

@@ -1,0 +1,157 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Create a versioned release after tests pass
+        type: boolean
+        default: false
+      version_increment:
+        description: Semantic version increment
+        type: choice
+        default: patch
+        options: [patch, minor, major]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+env:
+  SDK_VERSION: 10.0.26100.0
+  WDK_VERSION: 10.0.26100.6584
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Determine version once for both architectures
+        id: version
+        env:
+          INCREMENT: ${{ inputs.version_increment || 'patch' }}
+        run: |
+          python - <<'PY'
+          import os, re, subprocess
+          tags = subprocess.check_output(['git', 'tag', '--list'], text=True).splitlines()
+          versions = [tuple(map(int, m.groups())) for t in tags if (m := re.fullmatch(r'v(\d+)\.(\d+)\.(\d+)', t))]
+          version = list(max(versions, default=(0, 0, 0)))
+          index = {'major': 0, 'minor': 1, 'patch': 2}[os.environ['INCREMENT']]
+          version[index] += 1
+          version[index + 1:] = [0] * (2 - index)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('version=' + '.'.join(map(str, version)) + '\n')
+          PY
+
+  build:
+    runs-on: windows-2025
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: Win32
+            wdk: x86
+          - arch: x64
+            wdk: x64
+    steps:
+      - uses: actions/checkout@v5
+      - uses: NuGet/setup-nuget@v2
+      - name: Restore pinned WDK headers
+        shell: pwsh
+        run: |
+          nuget install Microsoft.Windows.WDK.${{ matrix.wdk }} -Version $env:WDK_VERSION -OutputDirectory wdk -DirectDownload -NonInteractive -DependencyVersion Ignore
+          if ($LASTEXITCODE) { throw 'WDK restore failed.' }
+      - name: Configure release
+        shell: pwsh
+        run: |
+          $wdk = (Resolve-Path "wdk/Microsoft.Windows.WDK.${{ matrix.wdk }}.$env:WDK_VERSION/c/Include/$env:SDK_VERSION").Path
+          cmake -S . -B build -A ${{ matrix.arch }} `
+            -DCMAKE_SYSTEM_VERSION=$env:SDK_VERSION "-DD3D9ON12_WDK_ROOT=$wdk" `
+            -DUSE_PIX=OFF -DD3D9ON12_BUILD_TESTS=ON `
+            -DD3D9ON12_BUILD_REVISION=${{ github.sha }} `
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON `
+            "-DCMAKE_CXX_FLAGS_RELEASE=/O2 /Ob3 /DNDEBUG /Zi" `
+            "-DCMAKE_SHARED_LINKER_FLAGS_RELEASE=/DEBUG /OPT:REF /OPT:ICF /INCREMENTAL:NO"
+          if ($LASTEXITCODE) { throw 'Configure failed.' }
+      - name: Restore shader signer
+        shell: pwsh
+        run: |
+          nuget install Microsoft.Direct3D.DxbcSigner -Version 1.0.0 -OutputDirectory build/packages -DirectDownload -NonInteractive
+          if ($LASTEXITCODE) { throw 'Signer restore failed.' }
+      - name: Build
+        run: cmake --build build --config Release --parallel -- /nr:false
+      - name: CPU regressions and local-driver runtime smoke test
+        shell: pwsh
+        run: |
+          $out = 'build/tests/Release'
+          Copy-Item build/src/Release/d3d9on12.dll $out
+          $signer = if ('${{ matrix.arch }}' -eq 'Win32') { 'win32' } else { 'x64' }
+          Copy-Item "build/packages/Microsoft.Direct3D.DxbcSigner.1.0.0/build/native/bin/$signer/dxbcSigner.dll" $out
+          foreach ($name in 'binding_state', 'upload_pool', 'allocation_info') {
+            & "$out/d3d9on12_${name}_probe.exe"
+            if ($LASTEXITCODE) { throw "CPU regression failed: $name" }
+          }
+          & "$out/d3d9on12_runtime_probe.exe" --require-local --require-extensions --require-release --reset
+          if ($LASTEXITCODE) { throw 'Local-driver runtime regression failed.' }
+      - name: Package binaries, symbols, licenses and provenance
+        shell: pwsh
+        run: ./scripts/Package-Release.ps1 -Build build -Output pkg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: D3D9On12-${{ matrix.arch }}
+          path: pkg/*.zip
+          if-no-files-found: error
+
+  publish:
+    needs: [version, build]
+    if: github.repository == 'ThirteenAG/D3D9On12' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Checksums
+        working-directory: artifacts
+        run: sha256sum *.zip > SHA256SUMS.txt
+      - name: Update latest prerelease
+        uses: ncipollo/release-action@v1
+        with:
+          tag: latest
+          commit: ${{ github.sha }}
+          name: D3D9On12 latest
+          prerelease: true
+          allowUpdates: true
+          removeArtifacts: true
+          replacesArtifacts: true
+          artifacts: artifacts/*
+          artifactErrorsFailBuild: true
+          body: |
+            D3D9On12 development build from `${{ github.sha }}`.
+            Win32 and x64 binaries, matching symbols, licenses, and build metadata.
+            CI runs CPU regressions and a local-driver runtime smoke test; this does not certify game performance parity.
+      - name: Publish versioned release
+        if: inputs.release == true
+        uses: ncipollo/release-action@v1
+        with:
+          tag: v${{ needs.version.outputs.version }}
+          commit: ${{ github.sha }}
+          name: D3D9On12 v${{ needs.version.outputs.version }}
+          artifacts: artifacts/*
+          artifactErrorsFailBuild: true
+          body: |
+            D3D9On12 v${{ needs.version.outputs.version }} from `${{ github.sha }}`.
+            Win32 and x64 binaries, matching symbols, licenses, and build metadata.

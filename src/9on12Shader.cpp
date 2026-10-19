@@ -33,6 +33,9 @@ namespace D3D9on12
             RETURN_E_INVALIDARG_AND_CHECK();
         }
 
+#if defined(D3D9ON12_BATCHED_RENDERING)
+        pDevice->GetContextForDestruction();
+#endif
         pDevice->m_PSDedupe.Release(static_cast<PixelShader*>(pShader));
 
         D3D9on12_DDI_ENTRYPOINT_END_AND_RETURN_HR(S_OK);
@@ -65,6 +68,9 @@ namespace D3D9on12
             RETURN_E_INVALIDARG_AND_CHECK();
         }
 
+#if defined(D3D9ON12_BATCHED_RENDERING)
+        pDevice->GetContextForDestruction();
+#endif
         pDevice->m_VSDedupe.Release(pShader);
 
         D3D9on12_DDI_ENTRYPOINT_END_AND_RETURN_HR(S_OK);
@@ -187,7 +193,6 @@ namespace D3D9on12
     D3D12PixelShader& PixelShader::GetD3D12Shader(ShaderConv::RasterStates rasterStates, const ShaderConv::VSOutputDecls& vsOutputDeclsOrig, D3D12Shader &inputShader)
     {
         HRESULT hr = S_OK;
-
         // Check for changes to VS outputs that shouldn't lead to a new
         // pixel shader generation
         ShaderConv::VSOutputDecls vsOutputDecls;

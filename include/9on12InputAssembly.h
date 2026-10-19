@@ -8,16 +8,23 @@ namespace D3D9on12
 
     struct InputBuffer
     {
-        void InitWithUploadData(Device& device, UINT strideInBytes, CONST VOID* pDataToUpload = nullptr);
-        void InitWithResource(Device& device, Resource* pAppResource, UINT64 bufferSize, UINT64 offset, UINT strideInBytes);
+        void InitWithUploadData(Device& device, UINT strideInBytes, CONST VOID* pDataToUpload = nullptr) noexcept;
+        void InitWithResource(Device& device, Resource* pAppResource, UINT64 offset, UINT strideInBytes) noexcept;
         void InitAsPersistentTriangleFan(Device & device, UINT64 bufferSize, UINT strideInBytes);
 
         UINT GetOffsetInBytesAPI() { return m_bufferOffset; }
         UINT GetOffsetInBytesD3D12();
         UINT GetStrideInBytes() { return m_bufferStride; }
 
+        void UpdatePersistentView(UINT offset, UINT stride) noexcept
+        {
+            Check9on12(m_pAppProvidedResource && !m_isSystemMemory);
+            m_bufferOffset = offset;
+            m_bufferStride = stride;
+        }
+
         VOID* GetSystemMemoryBase() { return (byte*)m_pDeferredSystemMemoryData + m_bufferOffset; }
-        VOID* GetTriangleFanMemory() { Check9on12(m_isTriangleFanIndexBuffer); return m_tempGPUBuffer.m_pMappedAddress; }
+        VOID* GetTriangleFanMemory() { Check9on12(m_isTriangleFanIndexBuffer); return m_gpuBuffer.m_pMappedAddress; }
 
         HRESULT Upload(Device& device, OffsetArg baseVertexIndex, UINT vertexCount);
         void ResetUploadedData();
@@ -26,7 +33,7 @@ namespace D3D9on12
         bool IsTriangleFan() { return m_isTriangleFanIndexBuffer; }
 
         Resource* GetAppResource() { return m_pAppProvidedResource; }
-        D3D12TranslationLayer::Resource * GetUnderlyingResource();
+        D3D12TranslationLayer::Resource* GetUnderlyingResource() const noexcept { return m_gpuBuffer.m_pResource; }
 
     private:
         Resource* m_pAppProvidedResource = nullptr;
@@ -36,7 +43,9 @@ namespace D3D9on12
         bool m_isSystemMemory = false;
         bool m_isTriangleFanIndexBuffer = false;
 
-        FastUploadAllocator::SubBuffer m_tempGPUBuffer = {};
+        // Resolved GPU view: borrowed app TL resource, per-draw upload, or owned
+        // triangle-fan storage. App-resource offsets/mapping remain zero/null.
+        FastUploadAllocator::SubBuffer m_gpuBuffer = {};
 
         UINT m_bufferStride = 0;
         UINT m_bufferOffset = 0;
@@ -51,15 +60,18 @@ namespace D3D9on12
         InputAssembly(PipelineStateDirtyFlags& pipelineStateDirtyFlags, RasterStatesWrapper& rasterStates);
 
         InputLayout &GetInputLayout() { return *m_pInputLayout; }
+        InputLayout* GetInputLayoutPointer() noexcept {return m_pInputLayout;}
 
         void SetVertexDeclaration(InputLayout *pInputLayout);
 
         UINT GetStream0Stride() { return m_inputStreams[0].GetStrideInBytes(); }
 
-        HRESULT SetVertexBuffer(Device &device, Resource *pVertexBuffer, UINT vbSlot, UINT offset, UINT stride);
-        void SetVertexBufferUM(Device& device, UINT vbSlot, UINT stride, _In_ CONST VOID* pData);
-        HRESULT SetIndexBuffer(Device &device, Resource *pResource, UINT stride);
-        HRESULT SetIndexBufferUM(Device &device, UINT indexBufferStride, _In_ const void *pIndices);
+        // Binding masks and input views are preallocated CPU state. Keep these
+        // setters nonthrowing; the DDI fast wrapper depends on that contract.
+        HRESULT SetVertexBuffer(Device &device, Resource *pVertexBuffer, UINT vbSlot, UINT offset, UINT stride) noexcept;
+        void SetVertexBufferUM(Device& device, UINT vbSlot, UINT stride, _In_ CONST VOID* pData) noexcept;
+        HRESULT SetIndexBuffer(Device &device, Resource *pResource, UINT stride) noexcept;
+        HRESULT SetIndexBufferUM(Device &device, UINT indexBufferStride, _In_ const void *pIndices) noexcept;
 
         HRESULT UploadDeferredInputBufferData(Device& device, OffsetArg baseVertexIndex, UINT vertexCount, OffsetArg baseIndexLocation, UINT indexCount);
         void ResetUploadBufferData();
@@ -71,6 +83,7 @@ namespace D3D9on12
         void RestorePreviousIB(Device &device);
 
         InputBuffer& CurrentIndexBuffer() { return m_IndexBufferStack.top(); }
+        InputBuffer& CurrentVertexBuffer(UINT slot) noexcept { return m_inputStreams[slot]; }
         
         static void CreateTriangleFanIndexBuffer(_In_ Device &device, _Out_ InputBuffer& targetBuffer, _In_ UINT& indexCount);
         static void CreateTriangleListIBFromTriangleFanIB(_In_ Device &device, 
@@ -79,15 +92,15 @@ namespace D3D9on12
         void PushNewIndexBuffer(_In_ InputBuffer & targetBuffer);
 
         void MarkIndexBufferDirty() { m_dirtyFlags.IndexBuffer = true; }
-        void MarkVertexBufferDirty() { m_dirtyFlags.VertexBuffers = true; }
+        void MarkVertexBufferDirty() { m_dirtyFlags.VertexBuffers = (1u << MAX_VERTEX_STREAMS) - 1; }
         UINT GetNumBoundStreams() { return m_numBoundVBs; }
 
     private:
-        bool InputBufferNeedsUpload(UINT streamIndex);
         void ResolveVertexBuffers(Device& device, OffsetArg BaseVertexStart);
 
         InputBuffer m_inputStreams[MAX_VERTEX_STREAMS];
         UINT m_numBoundVBs;
+        UINT m_systemMemoryStreams = 0;
 
 
         std::stack<InputBuffer> m_IndexBufferStack;

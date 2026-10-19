@@ -18,7 +18,7 @@ namespace D3D9on12
 
         PipelineStateKey key(psoDesc, pVS, pPS, pGS);
 
-        UINT64 timestamp = m_device.GetContext().GetCommandListID(D3D12TranslationLayer::COMMAND_LIST_TYPE::GRAPHICS);
+        UINT64 timestamp = m_device.GetPipelineCacheTimestamp();
 
         auto it = m_cache.m_map.find(key);
 
@@ -60,7 +60,9 @@ namespace D3D9on12
         VerifyPipelineState(desc);
 
         // No cached PSO exists, time to create one
-        cacheEntry->m_pPipelineState.reset(new D3D12TranslationLayer::PipelineState(&m_device.GetContext(), desc)); // throw( bad_alloc, _com_error )
+        {
+            cacheEntry->m_pPipelineState.reset(new D3D12TranslationLayer::PipelineState(&m_device.GetContext(), desc)); // throw( bad_alloc, _com_error )
+        }
 
         Check9on12(pPS->GetD3D9ParentShader());
         Check9on12(pVS->GetD3D9ParentShader());
@@ -87,7 +89,7 @@ namespace D3D9on12
         if (psoCacheTrimLimitAge == MAXDWORD)
             return;
 
-        UINT64 timestamp = m_device.GetContext().GetCommandListID(D3D12TranslationLayer::COMMAND_LIST_TYPE::GRAPHICS);
+        UINT64 timestamp = m_device.GetPipelineCacheTimestamp();
 
         while (m_cache.m_map.size() > (size_t)psoCacheTrimLimitSize)
         {
@@ -98,6 +100,10 @@ namespace D3D9on12
 
             if (age > (UINT64)psoCacheTrimLimitAge)
             {
+#if defined(D3D9ON12_BATCHED_RENDERING)
+                // Recorded packets borrow cached PSOs: drain before evicting one.
+                m_device.GetContext();
+#endif
                 std::shared_ptr<PipelineStateCacheEntry> cacheEntry = m_cache.m_accessOrder.back();
                 m_cache.m_accessOrder.pop_back();
 

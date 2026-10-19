@@ -1,0 +1,917 @@
+--- a/include/BatchedContext.hpp
++++ b/include/BatchedContext.hpp
+@@ -43,7 +43,7 @@
+ #define DECLARE_COMMAND_VALUE static constexpr UINT CmdValue = (__COUNTER__ - c_FirstCommandCounterValue);
+ 
+ public:
+-    static constexpr size_t BatchSizeInBytes = 2048;
++    static constexpr size_t BatchSizeInBytes = 16384;
+     struct BatchStorageAllocator
+     {
+         FreePageContainer* m_Container;
+@@ -508,6 +508,34 @@
+     // The 0-based value of the last command.
+     static constexpr UINT c_LastCommand = __COUNTER__ - c_FirstCommandCounterValue - 1;
+ 
++    #define D3D12TL_RECORDING_GROUP_SUPPORTED 1
++    // Hold the producer lock once across a related group of state packets.
++    // Foreign producers still acquire it normally. Ownership is thread-local;
++    // nested groups restore the preceding context before releasing their lock.
++    class RecordingScope
++    {
++        BatchedContext* m_Context;
++        std::unique_lock<std::recursive_mutex> m_Lock;
++        BatchedContext* m_PreviousContext = nullptr;
++    public:
++        explicit RecordingScope(BatchedContext* context) : m_Context(context)
++        {
++            if (context)
++            {
++                m_Lock = context->m_RecordingLock.TakeLock();
++                m_PreviousContext = s_RecordingContext;
++                s_RecordingContext = context;
++            }
++        }
++        ~RecordingScope()
++        {
++            if (m_Context)
++                s_RecordingContext = m_PreviousContext;
++        }
++        RecordingScope(RecordingScope const&) = delete;
++        RecordingScope& operator=(RecordingScope const&) = delete;
++    };
++
+     struct CreationArgs
+     {
+         bool CreatesAndDestroysAreMultithreaded : 1;
+@@ -544,7 +572,7 @@
+ 
+     template <typename TFunc> void AddPostBatchFunction(TFunc&& f)
+     {
+-        auto Lock = m_RecordingLock.TakeLock();
++        auto Lock = TakeRecordingLock();
+         m_PostBatchFunctions.emplace_back(std::forward<TFunc>(f));
+     }
+     template <typename T>
+@@ -554,7 +582,7 @@
+     }
+     void TRANSLATION_API ReleaseResource(Resource* pResource)
+     {
+-        auto Lock = m_RecordingLock.TakeLock();
++        auto Lock = TakeRecordingLock();
+         auto Size = pResource->GetResourceSize();
+         m_PostBatchFunctions.emplace_back([pResource]() { pResource->Release(); });
+         m_PendingDestructionMemorySize += Size;
+@@ -694,7 +722,7 @@
+     template <typename TExt, typename... Args> void EmplaceBatchExtension(BatchedExtension* pExt, Args&&... args)
+     {
+         assert(!IsBatchThread());
+-        auto Lock = m_RecordingLock.TakeLock();
++        auto Lock = TakeRecordingLock();
+         static_assert(std::is_trivially_destructible<TExt>::value, "Destructors don't get called on batched commands.");
+         const size_t ExtensionSize = TExt::GetExtensionSize(std::forward<Args>(args)...);
+         const size_t CommandSize = CmdExtension::GetCommandSize(pExt, nullptr, ExtensionSize);
+@@ -723,7 +751,7 @@
+     template <typename TCmd> void AddToBatch(BatchStorage& CurrentBatch, TCmd const& command);
+     template <typename TCmd> void AddToBatch(TCmd const& command)
+     {
+-        auto Lock = m_RecordingLock.TakeLock();
++        auto Lock = TakeRecordingLock();
+         AddToBatch(m_CurrentBatch, command);
+ 
+         ++m_CurrentCommandCount;
+@@ -779,6 +807,12 @@
+ 
+     static constexpr UINT c_CommandKickoffMinThreshold = 10; // Arbitrary for now
+     OptLock<std::recursive_mutex> m_RecordingLock{ m_CreationArgs.CreatesAndDestroysAreMultithreaded };
++    inline static thread_local BatchedContext* s_RecordingContext = nullptr;
++    std::unique_lock<std::recursive_mutex> TakeRecordingLock()
++    {
++        if (s_RecordingContext == this) { return {}; }
++        return m_RecordingLock.TakeLock();
++    }
+     UINT m_CurrentCommandCount = 0;
+     UINT m_NumOutstandingBatches = 0;
+     uint64_t m_RecordingBatchID = 1;
+@@ -831,4 +865,4 @@
+ };
+ 
+ 
+-}
+\ No newline at end of file
++}
+--- a/include/ImmediateContext.hpp
++++ b/include/ImmediateContext.hpp
+@@ -604,6 +604,8 @@
+     
+     e_GraphicsRootSignatureDirty  = 0x400000000,
+     e_ComputeRootSignatureDirty   = 0x800000000,
++    e_GraphicsRootCB0Dirty        = 0x1000000000,
++    e_ComputeRootCB0Dirty         = 0x2000000000,
+ 
+     // Bit combinations
+     e_VSBindingsDirty             = e_VSShaderResourcesDirty | e_VSConstantBuffersDirty | e_VSSamplersDirty,
+@@ -634,8 +636,8 @@
+     e_FixedFunctionDirty          = e_BlendFactorDirty | e_StencilRefDirty | e_PrimitiveTopologyDirty | e_ViewportsDirty | e_ScissorRectsDirty | e_PredicateDirty,
+ 
+     // All state bits by pipeline type
+-    e_GraphicsStateDirty          = e_PipelineStateDirty | e_GraphicsBindingsDirty | e_NonHeapBindingsDirty | e_FixedFunctionDirty | e_FirstDraw | e_GraphicsRootSignatureDirty,
+-    e_ComputeStateDirty           = e_PipelineStateDirty | e_ComputeBindingsDirty | e_FirstDispatch | e_ComputeRootSignatureDirty,
++    e_GraphicsStateDirty          = e_PipelineStateDirty | e_GraphicsBindingsDirty | e_NonHeapBindingsDirty | e_FixedFunctionDirty | e_FirstDraw | e_GraphicsRootSignatureDirty | e_GraphicsRootCB0Dirty,
++    e_ComputeStateDirty           = e_PipelineStateDirty | e_ComputeBindingsDirty | e_FirstDispatch | e_ComputeRootSignatureDirty | e_ComputeRootCB0Dirty,
+ 
+     // Accumulations of state bits set on command list boundaries and initialization
+     // New command lists require all state to be reasserted, but nothing new needs to be dirtied.  
+@@ -912,6 +914,7 @@
+     friend class Query;
+     friend class CommandListManager;
+ 
++    #define D3D12TL_ROOT_CB0_SUPPORTED 1
+     class CreationArgs
+     {
+     public:
+@@ -930,6 +933,8 @@
+         UINT DisableGPUTimeout : 1;
+         UINT IsXbox : 1;
+         UINT AdjustYUY2BlitCoords : 1;
++        // Opt-in only: caller does not require descriptor bounds checking.
++        UINT UseRootCB0 : 1;
+         GUID CreatorID;
+         DWORD MaxAllocatedUploadHeapSpacePerCommandList;
+         DWORD MaxSRVHeapSize;
+@@ -1335,6 +1340,7 @@
+         D3D12_GPU_DESCRIPTOR_HANDLE m_SRVTableBase{ 0 };
+         D3D12_GPU_DESCRIPTOR_HANDLE m_CBTableBase{ 0 };
+         D3D12_GPU_DESCRIPTOR_HANDLE m_SamplerTableBase{ 0 };
++        bool m_RootCB0Dirty = false;
+ 
+         UINT m_uConstantBufferOffsets[D3D11_COMMONSHADER_CONSTANT_BUFFER_HW_SLOT_COUNT] = {};
+         UINT m_uConstantBufferCounts[D3D11_COMMONSHADER_CONSTANT_BUFFER_HW_SLOT_COUNT] = {};
+@@ -1714,6 +1720,8 @@
+     } m_SyncronousOpScrachSpace;
+ 
+     const bool m_bUseRingBufferDescriptorHeaps;
++    unique_comptr<ID3D12Resource> m_ZeroRootCB0;
++    D3D12_GPU_VIRTUAL_ADDRESS m_ZeroRootCB0Address = 0;
+ 
+ public: // cached feature data
+ 
+--- a/include/ImmediateContext.inl
++++ b/include/ImmediateContext.inl
+@@ -285,6 +285,11 @@
+ }
+ 
+ //----------------------------------------------------------------------------------------------------------------------------------
++inline bool CConstantBufferBoundState::DirtyTableTail(UINT count) const noexcept
++{
++    return BitSetLessThan(m_DirtyBits.to_ulong() & ~1UL, count);
++}
++
+ inline bool CConstantBufferBoundState::UpdateBinding(_In_range_(0, NumBindings-1) UINT slot, _In_opt_ Resource* pBindable, EShaderStage stage) noexcept
+ {
+     auto& Current = m_Bound[slot];
+@@ -526,6 +531,11 @@
+         {
+             RootSignatureDesc const& OldDesc = m_CurrentState.m_pLastGraphicsRootSig->m_Desc;
+             RootSignatureDesc const& NewDesc = m_CurrentState.m_pPSO->GetRootSignature()->m_Desc;
++            if (OldDesc.UsesRootCB0() != NewDesc.UsesRootCB0())
++            {
++                m_DirtyStates |= e_PSConstantBuffersDirty | e_VSConstantBuffersDirty |
++                    e_GSConstantBuffersDirty | e_HSConstantBuffersDirty | e_DSConstantBuffersDirty;
++            }
+             static constexpr UINT64 CBDirtyBits[] = { e_PSConstantBuffersDirty, e_VSConstantBuffersDirty, e_GSConstantBuffersDirty, e_HSConstantBuffersDirty, e_DSConstantBuffersDirty };
+             static constexpr UINT64 SRVDirtyBits[] = { e_PSShaderResourcesDirty, e_VSShaderResourcesDirty, e_GSShaderResourcesDirty, e_HSShaderResourcesDirty, e_DSShaderResourcesDirty };
+             static constexpr UINT64 SamplerDirtyBits[] = { e_PSSamplersDirty, e_VSSamplersDirty, e_GSSamplersDirty, e_HSSamplersDirty, e_DSSamplersDirty };
+@@ -559,12 +569,25 @@
+     // Translate slot dirty bits to pipeline dirty bits now, since we know the shader declarations
+     auto pfnSetDirtySRVBindings = [this](SStageState& Stage, SShaderDecls* pShader, const RootSignatureDesc::ShaderStage& shaderStage, EDirtyBits eBit)
+     {
++        if (!pShader) { return; }
+         const TDeclVector EmptyDecls;
+-        if (Stage.m_SRVs.IsDirty(pShader ? pShader->m_ResourceDecls : EmptyDecls, shaderStage.GetSRVBindingCount(), !!(m_DirtyStates & eBit))) { m_DirtyStates |= eBit; }
++        // Declarations belong to the immutable PSO shaders. Until the PSO
++        // changes, only bound-slot dirtiness can require another SRV table.
++        const UINT count = shaderStage.GetSRVBindingCount();
++        const bool dirty = (m_DirtyStates & e_PipelineStateDirty)
++            ? Stage.m_SRVs.IsDirty(pShader ? pShader->m_ResourceDecls : EmptyDecls, count, !!(m_DirtyStates & eBit))
++            : Stage.m_SRVs.DirtyBitsUpTo(count);
++        if (dirty) { m_DirtyStates |= eBit; }
+     };
+     auto pfnSetDirtyCBBindings = [this](SStageState& Stage, const RootSignatureDesc::ShaderStage& shaderStage, EDirtyBits eBit)
+     {
+-        if (Stage.m_CBs.IsDirty(shaderStage.GetCBBindingCount())) { m_DirtyStates |= eBit; }
++        const bool rootCB0 = m_CurrentState.m_pPSO->GetRootSignature()->m_Desc.UsesRootCB0();
++        if (rootCB0)
++        {
++            Stage.m_RootCB0Dirty |= Stage.m_CBs.DirtyBitsUpTo(1);
++            if (Stage.m_RootCB0Dirty) { m_DirtyStates |= e_GraphicsRootCB0Dirty; }
++        }
++        if (Stage.m_CBs.IsDirty(shaderStage.GetCBBindingCount(), rootCB0)) { m_DirtyStates |= eBit; }
+     };
+     auto pfnSetDirtySamplerBindings = [this](SStageState& Stage, const RootSignatureDesc::ShaderStage& shaderStage, EDirtyBits eBit)
+     {
+@@ -576,17 +599,17 @@
+     pfnSetDirtySRVBindings(m_CurrentState.m_HS, m_CurrentState.m_pPSO->GetShader<e_HS>(), RootSigDesc.GetShaderStage<e_HS>(), e_HSShaderResourcesDirty);
+     pfnSetDirtySRVBindings(m_CurrentState.m_DS, m_CurrentState.m_pPSO->GetShader<e_DS>(), RootSigDesc.GetShaderStage<e_DS>(), e_DSShaderResourcesDirty);
+ 
+-    pfnSetDirtyCBBindings(m_CurrentState.m_PS, RootSigDesc.GetShaderStage<e_PS>(), e_PSConstantBuffersDirty);
+-    pfnSetDirtyCBBindings(m_CurrentState.m_VS, RootSigDesc.GetShaderStage<e_VS>(), e_VSConstantBuffersDirty);
+-    pfnSetDirtyCBBindings(m_CurrentState.m_GS, RootSigDesc.GetShaderStage<e_GS>(), e_GSConstantBuffersDirty);
+-    pfnSetDirtyCBBindings(m_CurrentState.m_HS, RootSigDesc.GetShaderStage<e_HS>(), e_HSConstantBuffersDirty);
+-    pfnSetDirtyCBBindings(m_CurrentState.m_DS, RootSigDesc.GetShaderStage<e_DS>(), e_DSConstantBuffersDirty);
+-
+-    pfnSetDirtySamplerBindings(m_CurrentState.m_PS, RootSigDesc.GetShaderStage<e_PS>(), e_PSSamplersDirty);
+-    pfnSetDirtySamplerBindings(m_CurrentState.m_VS, RootSigDesc.GetShaderStage<e_VS>(), e_VSSamplersDirty);
+-    pfnSetDirtySamplerBindings(m_CurrentState.m_GS, RootSigDesc.GetShaderStage<e_GS>(), e_GSSamplersDirty);
+-    pfnSetDirtySamplerBindings(m_CurrentState.m_HS, RootSigDesc.GetShaderStage<e_HS>(), e_HSSamplersDirty);
+-    pfnSetDirtySamplerBindings(m_CurrentState.m_DS, RootSigDesc.GetShaderStage<e_DS>(), e_DSSamplersDirty);
++    if (m_CurrentState.m_pPSO->GetShader<e_PS>()) { pfnSetDirtyCBBindings(m_CurrentState.m_PS, RootSigDesc.GetShaderStage<e_PS>(), e_PSConstantBuffersDirty); }
++    if (m_CurrentState.m_pPSO->GetShader<e_VS>()) { pfnSetDirtyCBBindings(m_CurrentState.m_VS, RootSigDesc.GetShaderStage<e_VS>(), e_VSConstantBuffersDirty); }
++    if (m_CurrentState.m_pPSO->GetShader<e_GS>()) { pfnSetDirtyCBBindings(m_CurrentState.m_GS, RootSigDesc.GetShaderStage<e_GS>(), e_GSConstantBuffersDirty); }
++    if (m_CurrentState.m_pPSO->GetShader<e_HS>()) { pfnSetDirtyCBBindings(m_CurrentState.m_HS, RootSigDesc.GetShaderStage<e_HS>(), e_HSConstantBuffersDirty); }
++    if (m_CurrentState.m_pPSO->GetShader<e_DS>()) { pfnSetDirtyCBBindings(m_CurrentState.m_DS, RootSigDesc.GetShaderStage<e_DS>(), e_DSConstantBuffersDirty); }
++
++    if (m_CurrentState.m_pPSO->GetShader<e_PS>()) { pfnSetDirtySamplerBindings(m_CurrentState.m_PS, RootSigDesc.GetShaderStage<e_PS>(), e_PSSamplersDirty); }
++    if (m_CurrentState.m_pPSO->GetShader<e_VS>()) { pfnSetDirtySamplerBindings(m_CurrentState.m_VS, RootSigDesc.GetShaderStage<e_VS>(), e_VSSamplersDirty); }
++    if (m_CurrentState.m_pPSO->GetShader<e_GS>()) { pfnSetDirtySamplerBindings(m_CurrentState.m_GS, RootSigDesc.GetShaderStage<e_GS>(), e_GSSamplersDirty); }
++    if (m_CurrentState.m_pPSO->GetShader<e_HS>()) { pfnSetDirtySamplerBindings(m_CurrentState.m_HS, RootSigDesc.GetShaderStage<e_HS>(), e_HSSamplersDirty); }
++    if (m_CurrentState.m_pPSO->GetShader<e_DS>()) { pfnSetDirtySamplerBindings(m_CurrentState.m_DS, RootSigDesc.GetShaderStage<e_DS>(), e_DSSamplersDirty); }
+ 
+     // Note: UAV decl scratch memory is reserved upfront, so these operations will not throw.
+     m_UAVDeclScratch.clear();
+@@ -790,22 +813,22 @@
+     if (bDispatch)
+     {
+         pfnAccumulate(e_CSShaderResourcesDirty, RootSigDesc.GetShaderStage<e_CS>().GetSRVBindingCount());
+-        pfnAccumulate(e_CSConstantBuffersDirty, RootSigDesc.GetShaderStage<e_CS>().GetCBBindingCount());
++        pfnAccumulate(e_CSConstantBuffersDirty, RootSigDesc.GetShaderStage<e_CS>().GetCBBindingCount() - (RootSigDesc.UsesRootCB0() ? 1u : 0u));
+         pfnAccumulate(e_CSUnorderedAccessViewsDirty, RootSigDesc.GetUAVBindingCount());
+     }
+     else
+     {
+-        pfnAccumulate(e_PSShaderResourcesDirty, RootSigDesc.GetShaderStage<e_PS>().GetSRVBindingCount());
+-        pfnAccumulate(e_VSShaderResourcesDirty, RootSigDesc.GetShaderStage<e_VS>().GetSRVBindingCount());
+-        pfnAccumulate(e_GSShaderResourcesDirty, RootSigDesc.GetShaderStage<e_GS>().GetSRVBindingCount());
+-        pfnAccumulate(e_HSShaderResourcesDirty, RootSigDesc.GetShaderStage<e_HS>().GetSRVBindingCount());
+-        pfnAccumulate(e_DSShaderResourcesDirty, RootSigDesc.GetShaderStage<e_DS>().GetSRVBindingCount());
+-
+-        pfnAccumulate(e_PSConstantBuffersDirty, RootSigDesc.GetShaderStage<e_PS>().GetCBBindingCount());
+-        pfnAccumulate(e_VSConstantBuffersDirty, RootSigDesc.GetShaderStage<e_VS>().GetCBBindingCount());
+-        pfnAccumulate(e_GSConstantBuffersDirty, RootSigDesc.GetShaderStage<e_GS>().GetCBBindingCount());
+-        pfnAccumulate(e_HSConstantBuffersDirty, RootSigDesc.GetShaderStage<e_HS>().GetCBBindingCount());
+-        pfnAccumulate(e_DSConstantBuffersDirty, RootSigDesc.GetShaderStage<e_DS>().GetCBBindingCount());
++        if (m_CurrentState.m_pPSO->GetShader<e_PS>()) { pfnAccumulate(e_PSShaderResourcesDirty, RootSigDesc.GetShaderStage<e_PS>().GetSRVBindingCount()); }
++        if (m_CurrentState.m_pPSO->GetShader<e_VS>()) { pfnAccumulate(e_VSShaderResourcesDirty, RootSigDesc.GetShaderStage<e_VS>().GetSRVBindingCount()); }
++        if (m_CurrentState.m_pPSO->GetShader<e_GS>()) { pfnAccumulate(e_GSShaderResourcesDirty, RootSigDesc.GetShaderStage<e_GS>().GetSRVBindingCount()); }
++        if (m_CurrentState.m_pPSO->GetShader<e_HS>()) { pfnAccumulate(e_HSShaderResourcesDirty, RootSigDesc.GetShaderStage<e_HS>().GetSRVBindingCount()); }
++        if (m_CurrentState.m_pPSO->GetShader<e_DS>()) { pfnAccumulate(e_DSShaderResourcesDirty, RootSigDesc.GetShaderStage<e_DS>().GetSRVBindingCount()); }
++
++        if (m_CurrentState.m_pPSO->GetShader<e_PS>()) { pfnAccumulate(e_PSConstantBuffersDirty, RootSigDesc.GetShaderStage<e_PS>().GetCBBindingCount() - (RootSigDesc.UsesRootCB0() ? 1u : 0u)); }
++        if (m_CurrentState.m_pPSO->GetShader<e_VS>()) { pfnAccumulate(e_VSConstantBuffersDirty, RootSigDesc.GetShaderStage<e_VS>().GetCBBindingCount() - (RootSigDesc.UsesRootCB0() ? 1u : 0u)); }
++        if (m_CurrentState.m_pPSO->GetShader<e_GS>()) { pfnAccumulate(e_GSConstantBuffersDirty, RootSigDesc.GetShaderStage<e_GS>().GetCBBindingCount() - (RootSigDesc.UsesRootCB0() ? 1u : 0u)); }
++        if (m_CurrentState.m_pPSO->GetShader<e_HS>()) { pfnAccumulate(e_HSConstantBuffersDirty, RootSigDesc.GetShaderStage<e_HS>().GetCBBindingCount() - (RootSigDesc.UsesRootCB0() ? 1u : 0u)); }
++        if (m_CurrentState.m_pPSO->GetShader<e_DS>()) { pfnAccumulate(e_DSConstantBuffersDirty, RootSigDesc.GetShaderStage<e_DS>().GetCBBindingCount() - (RootSigDesc.UsesRootCB0() ? 1u : 0u)); }
+ 
+         pfnAccumulate(e_UnorderedAccessViewsDirty, RootSigDesc.GetUAVBindingCount());
+     }
+@@ -827,11 +850,11 @@
+     }
+     else
+     {
+-        pfnAccumulate(e_PSSamplersDirty, RootSigDesc.GetShaderStage<e_PS>().GetSamplerBindingCount());
+-        pfnAccumulate(e_VSSamplersDirty, RootSigDesc.GetShaderStage<e_VS>().GetSamplerBindingCount());
+-        pfnAccumulate(e_GSSamplersDirty, RootSigDesc.GetShaderStage<e_GS>().GetSamplerBindingCount());
+-        pfnAccumulate(e_HSSamplersDirty, RootSigDesc.GetShaderStage<e_HS>().GetSamplerBindingCount());
+-        pfnAccumulate(e_DSSamplersDirty, RootSigDesc.GetShaderStage<e_DS>().GetSamplerBindingCount());
++        if (m_CurrentState.m_pPSO->GetShader<e_PS>()) { pfnAccumulate(e_PSSamplersDirty, RootSigDesc.GetShaderStage<e_PS>().GetSamplerBindingCount()); }
++        if (m_CurrentState.m_pPSO->GetShader<e_VS>()) { pfnAccumulate(e_VSSamplersDirty, RootSigDesc.GetShaderStage<e_VS>().GetSamplerBindingCount()); }
++        if (m_CurrentState.m_pPSO->GetShader<e_GS>()) { pfnAccumulate(e_GSSamplersDirty, RootSigDesc.GetShaderStage<e_GS>().GetSamplerBindingCount()); }
++        if (m_CurrentState.m_pPSO->GetShader<e_HS>()) { pfnAccumulate(e_HSSamplersDirty, RootSigDesc.GetShaderStage<e_HS>().GetSamplerBindingCount()); }
++        if (m_CurrentState.m_pPSO->GetShader<e_DS>()) { pfnAccumulate(e_DSSamplersDirty, RootSigDesc.GetShaderStage<e_DS>().GetSamplerBindingCount()); }
+     }
+     return NumRequiredSlots;
+ }
+@@ -848,6 +871,14 @@
+     }
+ 
+     SStageState& CurrentState = TShaderTraits::CurrentStageState(m_CurrentState);
++    if (!m_CurrentState.m_pPSO->GetShader<eShader>())
++    {
++        // A heap rollover may invalidate this inactive stage's old table.
++        // Preserve that invalidation in its slots until a shader uses it again.
++        std::bitset<decltype(CurrentState.m_SRVs)::NumBindings> dirtySlots;
++        CurrentState.m_SRVs.SetDirtyBits(dirtySlots.set());
++        return;
++    }
+     auto& SRVBindings = CurrentState.m_SRVs;
+     UINT RootSigHWM = m_CurrentState.m_pPSO->GetRootSignature()->m_Desc.GetShaderStage<eShader>().GetSRVBindingCount();
+     UINT numSRVs = RootSigHWM;
+@@ -878,13 +909,22 @@
+     }
+ 
+     SStageState& CurrentState = TShaderTraits::CurrentStageState(m_CurrentState);
++    if (!m_CurrentState.m_pPSO->GetShader<eShader>())
++    {
++        // A heap rollover may invalidate this inactive stage's old table.
++        // Preserve that invalidation in its slots until a shader uses it again.
++        std::bitset<decltype(CurrentState.m_CBs)::NumBindings> dirtySlots;
++        CurrentState.m_CBs.SetDirtyBits(dirtySlots.set());
++        return;
++    }
+     auto& CBBindings = CurrentState.m_CBs;
+     UINT numCBs = m_CurrentState.m_pPSO->GetRootSignature()->m_Desc.GetShaderStage<eShader>().GetCBBindingCount();
+     static const UINT MaxCBs = CBBindings.NumBindings;
+ 
+-    assert(HeapSlot + numCBs <= m_ViewHeap.m_Desc.NumDescriptors);
+-
+-    for (UINT i = 0; i < numCBs; ++i)
++    const UINT firstCB = m_CurrentState.m_pPSO->GetRootSignature()->m_Desc.UsesRootCB0() ? 1u : 0u;
++    assert(HeapSlot + numCBs - firstCB <= m_ViewHeap.m_Desc.NumDescriptors);
++
++    for (UINT i = firstCB; i < numCBs; ++i)
+     {
+         CBBindings.ResetDirty(i);
+         auto pBuffer = CBBindings.GetBound()[i];
+@@ -893,13 +933,13 @@
+         UINT APISize = CurrentState.m_uConstantBufferCounts[i] * 16;
+         GetBufferViewDesc(pBuffer, CBDesc, APIOffset, APISize);
+ 
+-        D3D12_CPU_DESCRIPTOR_HANDLE Descriptor = m_ViewHeap.CPUHandle(HeapSlot + i);
++        D3D12_CPU_DESCRIPTOR_HANDLE Descriptor = m_ViewHeap.CPUHandle(HeapSlot + i - firstCB);
+         m_pDevice12->CreateConstantBufferView(&CBDesc, Descriptor);
+     }
+ 
+     CurrentState.m_CBTableBase = m_ViewHeap.GPUHandle(HeapSlot);
+ 
+-    HeapSlot += numCBs;
++    HeapSlot += numCBs - firstCB;
+ }
+ 
+ //----------------------------------------------------------------------------------------------------------------------------------
+@@ -913,6 +953,14 @@
+     }
+ 
+     SStageState& CurrentState = TShaderTraits::CurrentStageState(m_CurrentState);
++    if (!m_CurrentState.m_pPSO->GetShader<eShader>())
++    {
++        // A heap rollover may invalidate this inactive stage's old table.
++        // Preserve that invalidation in its slots until a shader uses it again.
++        std::bitset<decltype(CurrentState.m_Samplers)::NumBindings> dirtySlots;
++        CurrentState.m_Samplers.SetDirtyBits(dirtySlots.set());
++        return;
++    }
+     UINT RootSigHWM = m_CurrentState.m_pPSO->GetRootSignature()->m_Desc.GetShaderStage<eShader>().GetSamplerBindingCount();
+     UINT numSamplers = RootSigHWM;
+     auto& SamplerBindings = CurrentState.m_Samplers;
+@@ -942,8 +990,7 @@
+         Desc.SizeInBytes =
+             min(GetDynamicBufferSize<TDesc>(pBuffer, APIOffset), APISize);
+         Desc.BufferLocation = Desc.SizeInBytes == 0 ? 0 :
+-            // TODO: Cache the GPU VA, frequent calls to this cause a CPU hotspot
+-            (pBuffer->GetUnderlyingResource()->GetGPUVirtualAddress() // Base of the DX12 resource
++            (pBuffer->GetBufferGPUVirtualAddress() // Base of the DX12 resource
+                 + pBuffer->GetSubresourcePlacement(0).Offset // Base of the DX11 resource after renaming
+                 + APIOffset); // Offset from the base of the DX11 resource
+     }
+@@ -961,12 +1008,20 @@
+     {
+         return &ID3D12GraphicsCommandList::SetGraphicsRootDescriptorTable;
+     }
++    static decltype(&ID3D12GraphicsCommandList::SetGraphicsRootConstantBufferView) GetRootCB0BindFunc()
++    {
++        return &ID3D12GraphicsCommandList::SetGraphicsRootConstantBufferView;
++    }
+ };
+ template<> struct DescriptorBindFuncs<e_CS>
+ {
+     static decltype(&ID3D12GraphicsCommandList::SetComputeRootDescriptorTable) GetBindFunc()
+     {
+         return &ID3D12GraphicsCommandList::SetComputeRootDescriptorTable;
++    }
++    static decltype(&ID3D12GraphicsCommandList::SetComputeRootConstantBufferView) GetRootCB0BindFunc()
++    {
++        return &ID3D12GraphicsCommandList::SetComputeRootConstantBufferView;
+     }
+ };
+ 
+@@ -984,7 +1039,7 @@
+ {
+     typedef SShaderTraits<eShader> TShaderTraits;
+     SStageState& CurrentState = TShaderTraits::CurrentStageState(m_CurrentState);
+-    if ((m_StatesToReassert & TShaderTraits::c_ShaderResourcesDirty) == 0)
++    if ((m_StatesToReassert & TShaderTraits::c_ShaderResourcesDirty) == 0 || !m_CurrentState.m_pPSO->GetShader<eShader>())
+     {
+         return;
+     }
+@@ -1008,14 +1063,33 @@
+ {
+     typedef SShaderTraits<eShader> TShaderTraits;
+     SStageState& CurrentState = TShaderTraits::CurrentStageState(m_CurrentState);
+-    if ((m_StatesToReassert & TShaderTraits::c_ConstantBuffersDirty) == 0)
++    const bool tableDirty = (m_StatesToReassert & TShaderTraits::c_ConstantBuffersDirty) != 0;
++    if (!tableDirty && !CurrentState.m_RootCB0Dirty)
+     {
+         return;
+     }
+-
+-    (GetGraphicsCommandList()->*DescriptorBindFuncs<eShader>::GetBindFunc())(
+-        CBBindIndices<eShader>::c_TableIndex,
+-        CurrentState.m_CBTableBase);
++    if (!m_CurrentState.m_pPSO->GetShader<eShader>())
++    {
++        return;
++    }
++    const bool rootCB0 = m_CurrentState.m_pPSO->GetRootSignature()->m_Desc.UsesRootCB0();
++    if (rootCB0 && (CurrentState.m_RootCB0Dirty || tableDirty))
++    {
++        D3D12_CONSTANT_BUFFER_VIEW_DESC view;
++        GetBufferViewDesc(CurrentState.m_CBs.GetBound()[0], view,
++            CurrentState.m_uConstantBufferOffsets[0] * 16,
++            CurrentState.m_uConstantBufferCounts[0] * 16);
++        constexpr UINT rootIndex = eShader == e_CS ? 4u : 16u + static_cast<UINT>(eShader);
++        (GetGraphicsCommandList()->*DescriptorBindFuncs<eShader>::GetRootCB0BindFunc())(
++            rootIndex, view.BufferLocation ? view.BufferLocation : m_ZeroRootCB0Address);
++        CurrentState.m_CBs.ResetDirty(0);
++        CurrentState.m_RootCB0Dirty = false;
++    }
++    if (tableDirty)
++    {
++        (GetGraphicsCommandList()->*DescriptorBindFuncs<eShader>::GetBindFunc())(
++            CBBindIndices<eShader>::c_TableIndex, CurrentState.m_CBTableBase);
++    }
+ }
+ 
+ //----------------------------------------------------------------------------------------------------------------------------------
+@@ -1032,7 +1106,7 @@
+ {
+     typedef SShaderTraits<eShader> TShaderTraits;
+     SStageState& CurrentState = TShaderTraits::CurrentStageState(m_CurrentState);
+-    if ((m_StatesToReassert & TShaderTraits::c_SamplersDirty) == 0)
++    if ((m_StatesToReassert & TShaderTraits::c_SamplersDirty) == 0 || !m_CurrentState.m_pPSO->GetShader<eShader>())
+     {
+         return;
+     }
+@@ -1117,6 +1191,10 @@
+         {
+             RootSignatureDesc const& OldDesc = m_CurrentState.m_pLastComputeRootSig->m_Desc;
+             RootSignatureDesc const& NewDesc = m_CurrentState.m_pPSO->GetRootSignature()->m_Desc;
++            if (OldDesc.UsesRootCB0() != NewDesc.UsesRootCB0())
++            {
++                m_DirtyStates |= e_CSConstantBuffersDirty;
++            }
+             if (NewDesc.m_ShaderStages[0].GetCBBindingCount() > OldDesc.m_ShaderStages[0].GetCBBindingCount())
+             {
+                 m_DirtyStates |= e_CSConstantBuffersDirty;
+@@ -1144,7 +1222,13 @@
+     const TDeclVector EmptyDecls;
+     auto pComputeShader = m_CurrentState.m_pPSO->GetShader<e_CS>();
+     m_DirtyStates |= m_CurrentState.m_CS.m_SRVs.IsDirty(pComputeShader ? pComputeShader->m_ResourceDecls : EmptyDecls, shaderStage.GetSRVBindingCount(), !!(m_DirtyStates & e_CSShaderResourcesDirty)) ? e_CSShaderResourcesDirty : 0;
+-    m_DirtyStates |= m_CurrentState.m_CS.m_CBs.IsDirty(shaderStage.GetCBBindingCount()) ? e_CSConstantBuffersDirty : 0;
++    const bool rootCB0 = RootSigDesc.UsesRootCB0();
++    if (rootCB0)
++    {
++        m_CurrentState.m_CS.m_RootCB0Dirty |= m_CurrentState.m_CS.m_CBs.DirtyBitsUpTo(1);
++        if (m_CurrentState.m_CS.m_RootCB0Dirty) { m_DirtyStates |= e_ComputeRootCB0Dirty; }
++    }
++    m_DirtyStates |= m_CurrentState.m_CS.m_CBs.IsDirty(shaderStage.GetCBBindingCount(), rootCB0) ? e_CSConstantBuffersDirty : 0;
+     m_DirtyStates |= m_CurrentState.m_CS.m_Samplers.IsDirty(shaderStage.GetSamplerBindingCount()) ? e_CSSamplersDirty : 0;
+     m_DirtyStates |= m_CurrentState.m_CSUAVs.IsDirty(pComputeShader ? pComputeShader->m_UAVDecls : EmptyDecls, RootSigDesc.GetUAVBindingCount(), !!(m_DirtyStates & e_CSUnorderedAccessViewsDirty)) ? e_CSUnorderedAccessViewsDirty : 0;
+ 
+--- a/include/Resource.hpp
++++ b/include/Resource.hpp
+@@ -418,6 +418,7 @@
+         AppResourceDesc* AppDesc() { return &m_creationArgs.m_appDesc; }
+ 
+         ID3D12Resource* GetUnderlyingResource() noexcept { return m_Identity->GetResource(); }
++        D3D12_GPU_VIRTUAL_ADDRESS GetBufferGPUVirtualAddress() const noexcept { return m_Identity->m_BufferGPUVirtualAddress; }
+         void UnderlyingResourceChanged() noexcept(false);
+         void ZeroConstantBufferPadding() noexcept;
+ 
+@@ -626,6 +627,9 @@
+ 
+             unique_comptr<ID3D12Resource> m_spUnderlyingResource;
+             D3D12ResourceSuballocation m_suballocation;
++            // Base VA belongs to the underlying allocation. Keep it with the
++            // identity so renames and back-buffer rotations carry it together.
++            D3D12_GPU_VIRTUAL_ADDRESS m_BufferGPUVirtualAddress = 0;
+ 
+             ID3D12Resource *GetOwnedResource()
+             {
+@@ -905,4 +909,4 @@
+         HRESULT AddFenceForUnwrapResidency(ID3D12CommandQueue* pQueue);
+ 
+     };
+-};
+\ No newline at end of file
++};
+--- a/include/ResourceBinding.hpp
++++ b/include/ResourceBinding.hpp
+@@ -304,6 +304,43 @@
+ 
+         bool UpdateBinding(_In_range_(0, NumBindings - 1) UINT slot, _In_opt_ Resource* pBindable, EShaderStage stage) noexcept;
+ 
++        bool IsDirty(_In_range_(0, NumBindings) UINT rootSignatureBucketSize, bool skipFirst = false) noexcept
++        {
++            // CB0 can be a root descriptor rather than part of the table.
++            bool bDirty = rootSignatureBucketSize > m_ShaderData ||
++                (skipFirst ? DirtyTableTail(rootSignatureBucketSize) : DirtyBitsUpTo(rootSignatureBucketSize));
++            m_ShaderData = rootSignatureBucketSize;
++
++            return bDirty;
++        }
++
++        void Clear(EShaderStage shader)
++        {
++            for (UINT i = 0; i < NumBindings; ++i)
++            {
++                UpdateBinding(i, nullptr, shader);
++            }
++        }
++    protected:
++        bool DirtyTableTail(UINT count) const noexcept;
++        _Field_range_(0, NumBindings) UINT m_ShaderData = 0;
++    };
++
++    //----------------------------------------------------------------------------------------------------------------------------------
++    class CSamplerBoundState : public CBoundState<Sampler, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT>
++    {
++    public:
++        typedef D3D12_CPU_DESCRIPTOR_HANDLE Descriptor;
++
++    public:
++        CSamplerBoundState() noexcept
++            : CBoundState()
++        {
++        }
++
++        bool UpdateBinding(_In_range_(0, NumBindings - 1) UINT slot,
++            _In_ Sampler* pBindable) noexcept;
++
+         bool IsDirty(_In_range_(0, NumBindings) UINT rootSignatureBucketSize) noexcept
+         {
+             bool bDirty = rootSignatureBucketSize > m_ShaderData || DirtyBitsUpTo(rootSignatureBucketSize);
+@@ -312,40 +349,6 @@
+             return bDirty;
+         }
+ 
+-        void Clear(EShaderStage shader)
+-        {
+-            for (UINT i = 0; i < NumBindings; ++i)
+-            {
+-                UpdateBinding(i, nullptr, shader);
+-            }
+-        }
+-    protected:
+-        _Field_range_(0, NumBindings) UINT m_ShaderData = 0;
+-    };
+-
+-    //----------------------------------------------------------------------------------------------------------------------------------
+-    class CSamplerBoundState : public CBoundState<Sampler, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT>
+-    {
+-    public:
+-        typedef D3D12_CPU_DESCRIPTOR_HANDLE Descriptor;
+-
+-    public:
+-        CSamplerBoundState() noexcept
+-            : CBoundState()
+-        {
+-        }
+-
+-        bool UpdateBinding(_In_range_(0, NumBindings - 1) UINT slot,
+-            _In_ Sampler* pBindable) noexcept;
+-
+-        bool IsDirty(_In_range_(0, NumBindings) UINT rootSignatureBucketSize) noexcept
+-        {
+-            bool bDirty = rootSignatureBucketSize > m_ShaderData || DirtyBitsUpTo(rootSignatureBucketSize);
+-            m_ShaderData = rootSignatureBucketSize;
+-
+-            return bDirty;
+-        }
+-
+         void FillDescriptors(_Out_writes_(NumBindings) Descriptor* pDescriptors, Descriptor* pNullDescriptor,
+             _In_range_(0, NumBindings) UINT RootSignatureHWM) noexcept
+         {
+--- a/include/RootSignature.hpp
++++ b/include/RootSignature.hpp
+@@ -10,7 +10,7 @@
+ 
+     struct VersionedRootSignatureDescWithStorage
+     {
+-        static constexpr UINT c_NumParameters = 16; // (CBV, SRV, Sampler) * 5 shader stages + UAV
++        static constexpr UINT c_NumParameters = 21; // Tables/UAV plus one optional root CBV per graphics stage
+         CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC RootDesc{ 0, (D3D12_ROOT_PARAMETER1*)nullptr };
+         CD3DX12_ROOT_PARAMETER1 Parameter[c_NumParameters];
+         static constexpr UINT c_NumExtraRangesForInterfaces = 15; // (CBs in space 1, samplers in spaces 1 and 2) * 5 shader stages
+@@ -105,13 +105,14 @@
+             Compute = 1,
+             RequiresBufferOutOfBoundsHandling = 2,
+             UsesShaderInterfaces = 4,
++            RootCB0 = 8,
+         };
+         const Flags m_Flags;
+ 
+         UINT m_NumSRVSpacesUsed[5];
+ 
+         template <int N>
+-        static Flags ComputeFlags(bool bRequiresBufferOutOfBoundsHandling, std::array<SShaderDecls const*, N> const& shaders)
++        static Flags ComputeFlags(bool bRequiresBufferOutOfBoundsHandling, std::array<SShaderDecls const*, N> const& shaders, bool useRootCB0)
+         {
+             UINT flags =
+                 ((N == 1) ? Compute : 0) |
+@@ -124,10 +125,14 @@
+                     break;
+                 }
+             }
++            if (useRootCB0 && !bRequiresBufferOutOfBoundsHandling && !(flags & UsesShaderInterfaces))
++            {
++                flags |= RootCB0;
++            }
+             return (Flags)flags;
+         }
+ 
+-        RootSignatureDesc(SShaderDecls const* pVS, SShaderDecls const* pPS, SShaderDecls const* pGS, SShaderDecls const* pHS, SShaderDecls const* pDS, bool bRequiresBufferOutOfBoundsHandling)
++        RootSignatureDesc(SShaderDecls const* pVS, SShaderDecls const* pPS, SShaderDecls const* pGS, SShaderDecls const* pHS, SShaderDecls const* pDS, bool bRequiresBufferOutOfBoundsHandling, bool useRootCB0 = false)
+             : m_ShaderStages{
+                 { ShaderStage(pPS) },
+                 { ShaderStage(pVS) },
+@@ -135,7 +140,7 @@
+                 { ShaderStage(pHS) },
+                 { ShaderStage(pDS) } }
+             , m_UAVBucket(NonCBBindingCountToBucket(NumUAVBindings(pVS, pPS, pGS, pHS, pDS)))
+-            , m_Flags(ComputeFlags<5>(bRequiresBufferOutOfBoundsHandling, std::array<SShaderDecls const*, 5>{ pPS, pVS, pGS, pHS, pDS }))
++            , m_Flags(ComputeFlags<5>(bRequiresBufferOutOfBoundsHandling, std::array<SShaderDecls const*, 5>{ pPS, pVS, pGS, pHS, pDS }, useRootCB0))
+             , m_NumSRVSpacesUsed{
+                 pPS ? pPS->m_NumSRVSpacesUsed : 1u,
+                 pVS ? pVS->m_NumSRVSpacesUsed : 1u,
+@@ -144,11 +149,11 @@
+                 pDS ? pDS->m_NumSRVSpacesUsed : 1u }
+         {
+         }
+-        RootSignatureDesc(SShaderDecls const* pCS, bool bRequiresBufferOutOfBoundsHandling)
++        RootSignatureDesc(SShaderDecls const* pCS, bool bRequiresBufferOutOfBoundsHandling, bool useRootCB0 = false)
+             : m_ShaderStages{
+                 { ShaderStage(pCS) } }
+                 , m_UAVBucket(NonCBBindingCountToBucket(pCS ? (UINT)pCS->m_UAVDecls.size() : 0u))
+-            , m_Flags(ComputeFlags<1>(bRequiresBufferOutOfBoundsHandling, std::array<SShaderDecls const*, 1>{ pCS }))
++                , m_Flags(ComputeFlags<1>(bRequiresBufferOutOfBoundsHandling, std::array<SShaderDecls const*, 1>{ pCS }, useRootCB0))
+             , m_NumSRVSpacesUsed{ pCS ? pCS->m_NumSRVSpacesUsed : 1u }
+         {
+         }
+@@ -156,6 +161,7 @@
+         RootSignatureDesc& operator=(RootSignatureDesc const&) = default;
+ 
+         UINT GetUAVBindingCount() const { return NonCBBucketToBindingCount(m_UAVBucket); }
++        bool UsesRootCB0() const { return (m_Flags & RootCB0) != 0; }
+         UINT64 GetAsUINT64() const { return *reinterpret_cast<const UINT64*>(this); }
+         void GetAsD3D12Desc(VersionedRootSignatureDescWithStorage& Storage, ImmediateContext* pParent) const;
+ 
+--- a/src/BatchedContext.cpp
++++ b/src/BatchedContext.cpp
+@@ -714,7 +714,7 @@
+ void BatchedContext::AddToBatchVariableSize(TCmd const& command, UINT NumEntries, TEntry const* entries)
+ {
+     assert(!IsBatchThread());
+-    auto Lock = m_RecordingLock.TakeLock();
++    auto Lock = TakeRecordingLock();
+     static_assert(std::is_trivially_destructible<TCmd>::value, "Destructors don't get called on batched commands.");
+     struct Temp { UINT CommandValue; TCmd Command; TEntry FirstEntry; };
+ 
+@@ -740,7 +740,7 @@
+ void BatchedContext::EmplaceInBatch(Args&&... args)
+ {
+     assert(!IsBatchThread());
+-    auto Lock = m_RecordingLock.TakeLock();
++    auto Lock = TakeRecordingLock();
+     static_assert(std::is_trivially_destructible<TCmd>::value, "Destructors don't get called on batched commands.");
+     const size_t CommandSize = TCmd::GetCommandSize(std::forward<Args>(args)...);
+     // GetCommandSize must ensure size is aligned correctly.
+@@ -827,6 +827,15 @@
+     // Ptr guaranteed to be aligned because alignof(UINT) <= alignof(Resource*)
+     auto pStrides = reinterpret_cast<UINT*>(ppVBs + numVBs);
+     auto pOffsets = pStrides + numVBs;
++    if (numVBs == 1)
++    {
++        // Most D3D9 meshes change only stream zero. Avoid three out-of-line
++        // copy calls for this single-entry packet.
++        ppVBs[0] = _ppVBs[0];
++        pStrides[0] = _pStrides[0];
++        pOffsets[0] = _pOffsets[0];
++        return;
++    }
+     std::copy(_ppVBs, _ppVBs + numVBs, ppVBs);
+     std::copy(_pStrides, _pStrides + numVBs, pStrides);
+     std::copy(_pOffsets, _pOffsets + numVBs, pOffsets);
+@@ -900,6 +909,14 @@
+     // Ptr guaranteed to be aligned because alignof(UINT) <= alignof(Resource*)
+     auto pFirstConstant = reinterpret_cast<UINT*>(ppCBs + numCBs);
+     auto pNumConstants = pFirstConstant + numCBs;
++    if (numCBs == 1)
++    {
++        // Float constants are versioned independently on ordinary draws.
++        ppCBs[0] = _ppCBs[0];
++        pFirstConstant[0] = _pFirstConstant[0];
++        pNumConstants[0] = _pNumConstants[0];
++        return;
++    }
+     std::copy(_ppCBs, _ppCBs + numCBs, ppCBs);
+     std::copy(_pFirstConstant, _pFirstConstant + numCBs, pFirstConstant);
+     std::copy(_pNumConstants, _pNumConstants + numCBs, pNumConstants);
+@@ -1299,7 +1316,7 @@
+         QueryEnd(pAsync);
+     }
+ 
+-    auto Lock = m_RecordingLock.TakeLock();
++    auto Lock = TakeRecordingLock();
+     pAsync->m_BatchReferenceID = m_RecordingBatchID;
+ 
+     AddToBatch(CmdQueryBegin{ pAsync->GetImmediateNoFlush() });
+@@ -1315,7 +1332,7 @@
+         QueryBegin(pAsync);
+     }
+ 
+-    auto Lock = m_RecordingLock.TakeLock();
++    auto Lock = TakeRecordingLock();
+     pAsync->m_BatchReferenceID = m_RecordingBatchID;
+ 
+     AddToBatch(CmdQueryEnd{ pAsync->GetImmediateNoFlush() });
+@@ -1327,7 +1344,7 @@
+ bool BatchedContext::SyncWithBatch(uint64_t& BatchID, bool DoNotFlush, TFunc&& GetImmObjectFenceValues)
+ {
+     {
+-        auto RecordingLock = m_RecordingLock.TakeLock();
++        auto RecordingLock = TakeRecordingLock();
+         assert(BatchID <= m_RecordingBatchID);
+ 
+         constexpr uint64_t GenerationIDMask = 0xffffffff00000000ull;
+@@ -1720,14 +1737,14 @@
+     assert(m_CreationArgs.pParentContext == nullptr);
+     if (m_CreationArgs.SubmitBatchesToWorkerThread)
+     {
+-        auto Lock = m_RecordingLock.TakeLock();
++        auto Lock = TakeRecordingLock();
+         SubmitBatch();
+         return WaitForBatchThreadIdle();
+     }
+     else
+     {
+         // Ensure destroys are executed even if a batch function errors out.
+-        auto Lock = m_RecordingLock.TakeLock();
++        auto Lock = TakeRecordingLock();
+         auto FunctionExit = MakeScopeExit([this]()
+         {
+             for (auto& fn : m_PostBatchFunctions)
+@@ -1779,7 +1796,7 @@
+ 
+     // Synchronize with threads recording to the batch
+     {
+-        auto Lock = m_RecordingLock.TakeLock();
++        auto Lock = TakeRecordingLock();
+         if (m_CurrentBatch.empty() && m_PostBatchFunctions.empty())
+         {
+             return nullptr;
+@@ -1814,7 +1831,7 @@
+     assert(!IsBatchThread());
+     auto pExecutionContext = m_CreationArgs.pParentContext ? m_CreationArgs.pParentContext : this;
+ 
+-    auto Lock = m_RecordingLock.TakeLock();
++    auto Lock = TakeRecordingLock();
+     AddToBatch(m_CurrentBatch, CmdExecuteNestedBatch{ pBatch, pExecutionContext });
+ 
+     m_CurrentCommandCount += pBatch->m_NumCommands;
+@@ -1869,7 +1886,7 @@
+     }
+ 
+     {
+-        auto Lock = m_RecordingLock.TakeLock();
++        auto Lock = TakeRecordingLock();
+ 
+         // Check if there's room in the semaphores.
+         assert(m_NumOutstandingBatches <= c_MaxOutstandingBatches);
+--- a/src/ImmediateContext.cpp
++++ b/src/ImmediateContext.cpp
+@@ -370,6 +370,21 @@
+ 
+     m_CommandLists[(UINT)COMMAND_LIST_TYPE::GRAPHICS].reset(new CommandListManager(this, pQueue, COMMAND_LIST_TYPE::GRAPHICS)); // throw( bad_alloc )
+     m_CommandLists[(UINT)COMMAND_LIST_TYPE::GRAPHICS]->InitCommandList();
++    if (m_CreationArgs.UseRootCB0 && !m_CreationArgs.RequiresBufferOutOfBoundsHandling)
++    {
++        // Root descriptors have no NULL-read semantics. Supply real zeroed
++        // storage for unbound CB0; Shutdown waits before releasing this buffer.
++        auto props = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD, GetNodeMask(), GetNodeMask());
++        auto desc = CD3DX12_RESOURCE_DESC::Buffer(D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16);
++        ThrowFailure(m_pDevice12->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE,
++            &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_ZeroRootCB0)));
++        D3D12_RANGE noRead{0, 0};
++        void* data = nullptr;
++        ThrowFailure(m_ZeroRootCB0->Map(0, &noRead, &data));
++        ZeroMemory(data, static_cast<SIZE_T>(desc.Width));
++        m_ZeroRootCB0->Unmap(0, nullptr);
++        m_ZeroRootCB0Address = m_ZeroRootCB0->GetGPUVirtualAddress();
++    }
+ }
+ 
+ bool ImmediateContext::Shutdown() noexcept
+--- a/src/PipelineState.cpp
++++ b/src/PipelineState.cpp
+@@ -8,12 +8,8 @@
+         : DeviceChildImpl(pContext)
+         , m_PipelineStateType(e_Draw)
+         , m_pRootSignature(pContext->CreateOrRetrieveRootSignature(
+-            RootSignatureDesc(desc.pVertexShader,
+-                              desc.pPixelShader,
+-                              desc.pGeometryShader,
+-                              desc.pHullShader,
+-                              desc.pDomainShader,
+-                              pContext->RequiresBufferOutofBoundsHandling())))
++            RootSignatureDesc(desc.pVertexShader, desc.pPixelShader, desc.pGeometryShader,
++                desc.pHullShader, desc.pDomainShader, pContext->RequiresBufferOutofBoundsHandling(), pContext->m_CreationArgs.UseRootCB0)))
+     {
+         Graphics.m_Desc = desc;
+         Graphics.m_Desc.pRootSignature = m_pRootSignature->GetForImmediateUse();
+@@ -51,7 +47,7 @@
+         , m_PipelineStateType(e_Dispatch)
+         , m_pRootSignature(pContext->CreateOrRetrieveRootSignature(
+             RootSignatureDesc(desc.pCompute,
+-                              pContext->RequiresBufferOutofBoundsHandling())))
++                              pContext->RequiresBufferOutofBoundsHandling(), pContext->m_CreationArgs.UseRootCB0)))
+     {
+         Compute.m_Desc = desc;
+         Compute.m_Desc.pRootSignature = m_pRootSignature->GetForImmediateUse();
+@@ -145,4 +141,4 @@
+             ThrowFailure(hr); // throw( _com_error )
+         }
+     }
+-}
+\ No newline at end of file
++}
+--- a/src/Resource.cpp
++++ b/src/Resource.cpp
+@@ -626,10 +626,16 @@
+     //----------------------------------------------------------------------------------------------------------------------------------
+     void Resource::UnderlyingResourceChanged() noexcept(false)
+     {
++        m_Identity->m_BufferGPUVirtualAddress = 0;
+         // Tile pools don't have a resource
+         if (!m_Identity->GetResource())
+         {
+             return;
++        }
++
++        if (Parent()->ResourceDimension12() == D3D12_RESOURCE_DIMENSION_BUFFER)
++        {
++            m_Identity->m_BufferGPUVirtualAddress = m_Identity->GetResource()->GetGPUVirtualAddress();
+         }
+ 
+         m_Identity->m_currentState.Reset();
+--- a/src/ResourceState.cpp
++++ b/src/ResourceState.cpp
+@@ -1107,6 +1107,13 @@
+     //----------------------------------------------------------------------------------------------------------------------------------
+     void ResourceStateManager::ApplyAllResourceTransitions(bool bIsPreDraw) noexcept(false)
+     {
++        // Without a transitioning resource there is no destination queue, no
++        // barrier, and no resource-triggered deferred wait to submit. In
++        // particular, leave swapchain waits queued until a resource uses them.
++        if (D3D12TranslationLayer::IsListEmpty(&m_TransitionListHead))
++        {
++            return;
++        }
+         CommandListManager* pCommandListManagers[(UINT)COMMAND_LIST_TYPE::MAX_VALID];
+         UINT64 CurrentFenceValues[(UINT)COMMAND_LIST_TYPE::MAX_VALID];
+         for (UINT i = 0; i < (UINT)COMMAND_LIST_TYPE::MAX_VALID; ++i)
+--- a/src/RootSignature.cpp
++++ b/src/RootSignature.cpp
+@@ -72,7 +72,8 @@
+ 
+             bCB14 |= Stage.IsCB14();
+             Storage.Parameter[ParameterIndex].InitAsDescriptorTable(1, &Storage.DescriptorRanges[RangeIndex], Visibility);
+-            Storage.DescriptorRanges[RangeIndex++].Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, Stage.GetCBBindingCount(), 0, 0, RangeFlags);
++            const UINT firstTableCB = UsesRootCB0() ? 1u : 0u;
++            Storage.DescriptorRanges[RangeIndex++].Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, Stage.GetCBBindingCount() - firstTableCB, firstTableCB, 0, RangeFlags);
+             if (Stage.m_UsesShaderInterfaces)
+             {
+                 Storage.DescriptorRanges[RangeIndex++].Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, D3D12_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT, 0, 1, InterfacesRangeFlags, 0);
+@@ -109,6 +110,16 @@
+         Storage.DescriptorRanges[RangeIndex++].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, GetUAVBindingCount(), 0, 0, RangeFlags);
+         ++ParameterIndex;
+ 
++        if (UsesRootCB0())
++        {
++            for (UINT i = 0; i < NumShaderStages; ++i)
++            {
++                Storage.Parameter[ParameterIndex++].InitAsConstantBufferView(0, 0,
++                    D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
++                    GetShaderVisibility(bGraphics ? (EShaderStage)i : e_CS));
++            }
++        }
++
+         assert(ParameterIndex <= VersionedRootSignatureDescWithStorage::c_NumParameters);
+         assert(RangeIndex <= VersionedRootSignatureDescWithStorage::c_NumParameters + VersionedRootSignatureDescWithStorage::c_NumExtraRangesForInterfaces);
+ 
+@@ -121,4 +132,4 @@
+             (bCB14 ? ROOT_SIGNATURE_FLAG_ALLOW_LOW_TIER_RESERVED_HW_CB_LIMIT : D3D12_ROOT_SIGNATURE_FLAG_NONE);
+         Storage.RootDesc.Init_1_1(ParameterIndex, Storage.Parameter, 0, NULL, Flags);
+     }
+-};
+\ No newline at end of file
++};

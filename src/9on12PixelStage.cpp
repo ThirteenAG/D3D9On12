@@ -4,6 +4,23 @@
 
 namespace D3D9on12
 {
+    template<typename View, typename Bind>
+    static void BindDirtyViewRuns(UINT dirtyMask, View** views, Bind bind)
+    {
+        // D3D9's displacement sampler separates the PS and VS register banks.
+        // Never merge a packet across that gap or include an unchanged slot.
+        for (UINT first = 0; first < MAX_SAMPLERS_STAGES;)
+        {
+            if (first == DMAP_SAMPLER || !(dirtyMask & BIT(first))) { ++first; continue; }
+            const UINT limit = first < MAX_PIXEL_SAMPLERS ? MAX_PIXEL_SAMPLERS : MAX_SAMPLERS_STAGES;
+            UINT end = first + 1;
+            while (end < limit && (dirtyMask & BIT(end))) ++end;
+            const bool pixel = first < MAX_PIXEL_SAMPLERS;
+            bind(pixel, pixel ? first : first - VERTEX_SAMPLER0, end - first, views + first);
+            first = end;
+        }
+    }
+
     _Check_return_ HRESULT APIENTRY UpdateWindowInfo(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_WINFO* pWInfo)
     {
         D3D9on12_DDI_ENTRYPOINT_START(TRUE);
@@ -55,6 +72,7 @@ namespace D3D9on12
 
         const UINT subresource = pResource ? pResource->ConvertAppSubresourceToDX12Subresource(pSetRenderTargetArg->SubResourceIndex) : 0;
 
+        if (pResource) pResource->MarkGpuWritten();
         pDevice->GetPipelineState().GetPixelStage().SetRenderTarget(pSetRenderTargetArg->RenderTargetIndex, BoundRenderTarget(pResource, subresource));
         D3D9on12_DDI_ENTRYPOINT_END_AND_RETURN_HR(S_OK);
     }
@@ -70,6 +88,7 @@ namespace D3D9on12
         }
 
         Resource *pResource = Resource::GetResourceFromHandle(pSetDepthStencilArg->hZBuffer);
+        if (pResource) pResource->MarkGpuWritten();
         pDevice->GetPipelineState().GetPixelStage().SetDepthStencil(pResource);
         D3D9on12_DDI_ENTRYPOINT_END_AND_RETURN_HR(S_OK);
     }
@@ -77,6 +96,14 @@ namespace D3D9on12
     HRESULT PixelStage::SetSRV(Device& device, Resource* pResource, UINT dx9TextureIndex)
     {
         UNREFERENCED_PARAMETER(device);
+
+        // Persistent resource format/type metadata is immutable. System-memory
+        // sources do not match here: the bound SRV is their backing resource,
+        // so they still run the upload/copy path on every bind.
+        if (m_shaderResources[dx9TextureIndex] == pResource)
+        {
+            return S_OK;
+        }
 
         DWORD shaderRegister;
         D3D12TranslationLayer::EShaderStage shaderType;
@@ -193,12 +220,9 @@ namespace D3D9on12
         return S_OK;
     }
 
-    void PixelStage::MarkSRVIndicesDirty(const std::vector<UINT> &indices)
+    void PixelStage::MarkSRVIndicesDirty(UINT bindingMask)
     {
-        for (UINT index : indices)
-        {
-            m_dirtyFlags.Textures |= BIT(index);
-        }
+        m_dirtyFlags.Textures |= bindingMask;
     }
 
 
@@ -223,13 +247,13 @@ namespace D3D9on12
             if (m_pDepthStencil)
             {
                 m_pDepthStencil->GetDSVBindingTracker().Unbind(0);
-                MarkSRVIndicesDirty(m_pDepthStencil->GetSRVBindingTracker().GetBindingIndices());
+                MarkSRVIndicesDirty(m_pDepthStencil->GetSRVBindingTracker().GetBindingMask());
             }
 
             if (pDepthStencil)
             {
                 pDepthStencil->GetDSVBindingTracker().Bind(0);
-                MarkSRVIndicesDirty(pDepthStencil->GetSRVBindingTracker().GetBindingIndices());
+                MarkSRVIndicesDirty(pDepthStencil->GetSRVBindingTracker().GetBindingMask());
             }
 
             m_pDepthStencil = pDepthStencil;
@@ -272,13 +296,13 @@ namespace D3D9on12
             if (pPrevResource)
             {
                 pPrevResource->GetRTVBindingTracker().Unbind(renderTargetIndex);
-                MarkSRVIndicesDirty(pPrevResource->GetSRVBindingTracker().GetBindingIndices());
+                MarkSRVIndicesDirty(pPrevResource->GetSRVBindingTracker().GetBindingMask());
             }
 
             if (pNewResource)
             {
                 pNewResource->GetRTVBindingTracker().Bind(renderTargetIndex);
-                MarkSRVIndicesDirty(pNewResource->GetSRVBindingTracker().GetBindingIndices());
+                MarkSRVIndicesDirty(pNewResource->GetSRVBindingTracker().GetBindingMask());
 
                 bool bDisableAlpha = pNewResource->IsAlphaChannelDisabled();
                 UINT rtvShaderComponentMapping = ConvertFormatToShaderResourceViewComponentMapping(pNewResource->GetD3DFormat());
@@ -356,7 +380,7 @@ namespace D3D9on12
 
     void PixelStage::SetDepthStencilState(Device& device, DWORD dwState, DWORD dwValue)
     {
-        auto& context = device.GetContext();
+        auto& context = device.GetRenderContext();
 
         switch (dwState)
         {
@@ -385,7 +409,7 @@ namespace D3D9on12
                 // Hide or unhide the SRVs of the current depth stencil as appropriate
                 if (m_pDepthStencil)
                 {
-                    MarkSRVIndicesDirty(m_pDepthStencil->GetSRVBindingTracker().GetBindingIndices());
+                    MarkSRVIndicesDirty(m_pDepthStencil->GetSRVBindingTracker().GetBindingMask());
                 }
             }
 
@@ -471,7 +495,7 @@ namespace D3D9on12
 
     void PixelStage::SetBlendState(Device& device, DWORD dwState, DWORD dwValue)
     {
-        auto& context = device.GetContext();
+        auto& context = device.GetRenderContext();
 
         switch (dwState)
         {
@@ -689,7 +713,7 @@ namespace D3D9on12
             renderTargetsToSet = D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT;
         }
 
-        device.GetContext().OMSetRenderTargets(ppRTVs, renderTargetsToSet, pDSV);
+        device.GetRenderContext().OMSetRenderTargets(ppRTVs, renderTargetsToSet, pDSV);
     }
 
     Resource* PixelStage::FindFirstValidBoundWritableResource()
@@ -719,7 +743,7 @@ namespace D3D9on12
     {
         HRESULT hr = S_OK;
 
-        auto& context = device.GetContext();
+        auto& context = device.GetRenderContext();
 
         // Need to check if multisampling is enabled first for the logic that determines if 
         // the depth stencil should be hid
@@ -781,27 +805,21 @@ namespace D3D9on12
 
         if (m_dirtyFlags.Samplers)
         {
+            D3D12TranslationLayer::Sampler* samplers[MAX_SAMPLERS_STAGES];
+            const UINT dirtySamplers = m_dirtyFlags.Samplers;
             for (UINT i = 0; i < MAX_SAMPLERS_STAGES; i++)
             {
-                if (m_dirtyFlags.Samplers & BIT(i))
+                if (dirtySamplers & BIT(i))
                 {
-                    DWORD shaderRegister;
-                    D3D12TranslationLayer::EShaderStage shaderStage;
-
-                    D3D12TranslationLayer::Sampler* sampler = m_samplerCache.GetSampler(device, m_samplerStateIDs[i]);
-                    ConvertDX9TextureIndexToShaderStageAndRegisterIndex(i, shaderStage, shaderRegister);
-
-                    if (shaderStage == D3D12TranslationLayer::e_PS)
-                    {
-                        context.SetSamplers<D3D12TranslationLayer::e_PS>(shaderRegister, 1, &sampler);
-                    }
-                    else
-                    {
-                        context.SetSamplers<D3D12TranslationLayer::e_VS>(shaderRegister, 1, &sampler);
-                    }
-
+                    if (i != DMAP_SAMPLER)
+                        samplers[i] = m_samplerCache.GetSampler(device, m_samplerStateIDs[i]);
                 }
             }
+            BindDirtyViewRuns(dirtySamplers, samplers,
+                [&](bool pixel, UINT first, UINT count, D3D12TranslationLayer::Sampler** views) {
+                    if (pixel) context.SetSamplers<D3D12TranslationLayer::e_PS>(first, count, views);
+                    else context.SetSamplers<D3D12TranslationLayer::e_VS>(first, count, views);
+                });
         }
 
         if (m_dirtyFlags.DepthStencil)
@@ -883,7 +901,9 @@ namespace D3D9on12
         textureDirtyMaskToKeep = 0;
         if (m_dirtyFlags.Textures)
         {
-            UINT textureMask = m_dirtyFlags.Textures;
+            D3D12TranslationLayer::SRV* srvs[MAX_SAMPLERS_STAGES];
+            const UINT dirtyTextures = m_dirtyFlags.Textures;
+            UINT textureMask = dirtyTextures;
             for (UINT i = 0; textureMask > 0; textureMask = textureMask >> 1, ++i)
             {
                 if (textureMask & BIT(0))
@@ -957,16 +977,14 @@ namespace D3D9on12
                         }
                     }
 
-                    if (shaderStage == D3D12TranslationLayer::e_PS)
-                    {
-                        context.SetShaderResources<D3D12TranslationLayer::e_PS>(shaderRegister, 1, &pSRV);
-                    }
-                    else
-                    {
-                        context.SetShaderResources<D3D12TranslationLayer::e_VS>(shaderRegister, 1, &pSRV);
-                    }
+                    srvs[i] = pSRV;
                 }
             }
+            BindDirtyViewRuns(dirtyTextures, srvs,
+                [&](bool pixel, UINT first, UINT count, D3D12TranslationLayer::SRV** views) {
+                    if (pixel) context.SetShaderResources<D3D12TranslationLayer::e_PS>(first, count, views);
+                    else context.SetShaderResources<D3D12TranslationLayer::e_VS>(first, count, views);
+                });
         }
 
         if (m_dirtyFlags.DepthStencilState)

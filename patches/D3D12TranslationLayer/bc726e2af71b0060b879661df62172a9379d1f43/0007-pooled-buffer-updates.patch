@@ -1,0 +1,84 @@
+--- a/include/ImmediateContext.hpp
++++ b/include/ImmediateContext.hpp
+@@ -1,6 +1,7 @@
+ // Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT License.
+ #pragma once
++#define D3D12TL_POOLED_BUFFER_UPDATES 1
+ #include <optional>
+ 
+ namespace D3D12TranslationLayer
+--- a/src/ImmediateContext.cpp
++++ b/src/ImmediateContext.cpp
+@@ -2909,8 +2909,41 @@
+     // Copy contents over from the temporary upload heap 
+     ID3D12GraphicsCommandList *pGraphicsCommandList = GetGraphicsCommandList();
+ 
++    ID3D12Resource* copySource = mappableResource.GetResource();
++    UINT64 copySourceOffset = mappableResource.GetOffset();
++    const bool uploadDestination = !pDst->GetIdentity()->m_bOwnsUnderlyingResource &&
++        pDst->GetAllocatorHeapType() == AllocatorHeapType::Upload;
++    if (pDst->AppDesc()->ResourceDimension() == D3D12_RESOURCE_DIMENSION_BUFFER &&
++        copySource == pDst->GetUnderlyingResource())
++    {
++        // Independent upload slices may share a native buffer. A source and
++        // destination cannot simultaneously put that buffer in incompatible
++        // copy states, so route this copy through a reusable DEFAULT buffer.
++        const UINT64 bytes = bUseLocalPlacement ? LocalPlacementDescs[0].Footprint.Width :
++            pDst->GetSubresourcePlacement(0).Footprint.Width;
++        if (!m_pStagingBuffer || m_pStagingBuffer->Parent()->m_desc12.Width < bytes)
++        {
++            ResourceCreationArgs args = {};
++            args.m_desc12 = CD3DX12_RESOURCE_DESC::Buffer(bytes);
++            args.m_appDesc = AppResourceDesc(args.m_desc12, RESOURCE_USAGE_DEFAULT,
++                (RESOURCE_CPU_ACCESS)0, (RESOURCE_BIND_FLAGS)0);
++            args.m_heapDesc = CD3DX12_HEAP_DESC(bytes, GetHeapProperties(D3D12_HEAP_TYPE_DEFAULT));
++            m_pStagingBuffer = Resource::CreateResource(this, args, ResourceAllocationContext::ImmediateContextThreadLongLived);
++        }
++        m_ResourceStateManager.TransitionResource(pDst, D3D12_RESOURCE_STATE_COPY_SOURCE);
++        m_ResourceStateManager.TransitionResource(m_pStagingBuffer.get(), D3D12_RESOURCE_STATE_COPY_DEST);
++        m_ResourceStateManager.ApplyAllResourceTransitions();
++        pGraphicsCommandList = GetGraphicsCommandList();
++        pGraphicsCommandList->CopyBufferRegion(m_pStagingBuffer->GetUnderlyingResource(), 0,
++            copySource, copySourceOffset, bytes);
++        m_pStagingBuffer->UsedInCommandList(COMMAND_LIST_TYPE::GRAPHICS, GetCommandListID(COMMAND_LIST_TYPE::GRAPHICS));
++        copySource = m_pStagingBuffer->GetUnderlyingResource();
++        copySourceOffset = 0;
++        m_ResourceStateManager.TransitionResource(m_pStagingBuffer.get(), D3D12_RESOURCE_STATE_COPY_SOURCE);
++    }
+     m_ResourceStateManager.TransitionSubresources(pDst, SubresourceIteration, D3D12_RESOURCE_STATE_COPY_DEST);
+     m_ResourceStateManager.ApplyAllResourceTransitions();
++    pGraphicsCommandList = GetGraphicsCommandList();
+ 
+     auto DoFinalize = [&]()
+     {
+@@ -2924,13 +2957,13 @@
+                 if (pDst->AppDesc()->ResourceDimension() == D3D12_RESOURCE_DIMENSION_BUFFER)
+                 {
+                     ASSUME(Placement.Footprint.Height == 1 && Placement.Footprint.Depth == 1);
+-                    UINT64 srcOffset = mappableResource.GetOffset();
++                    UINT64 srcOffset = copySourceOffset;
+                     UINT64 dstOffset =
+                         pDst->GetSubresourcePlacement(0).Offset +
+                         (PreparedStorage.bDstBoxPresent ? PreparedStorage.DstX : 0);
+                     pGraphicsCommandList->CopyBufferRegion(pDst->GetUnderlyingResource(),
+                                                            dstOffset,
+-                                                           mappableResource.GetResource(),
++                                                           copySource,
+                                                            srcOffset,
+                                                            Placement.Footprint.Width);
+                 }
+@@ -2963,6 +2996,13 @@
+         DoFinalize();
+     }
+ 
++    if (uploadDestination)
++    {
++        // Other logical resources and future staging copies share this buffer
++        // and expect the upload pool's complete read state.
++        m_ResourceStateManager.TransitionResource(pDst, GetDefaultPoolState(AllocatorHeapType::Upload));
++        m_ResourceStateManager.ApplyAllResourceTransitions();
++    }
+     AdditionalCommandsAdded(COMMAND_LIST_TYPE::GRAPHICS);
+     PostUpload();
+ 

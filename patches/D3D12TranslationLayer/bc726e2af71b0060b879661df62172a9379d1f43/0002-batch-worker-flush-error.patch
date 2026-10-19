@@ -1,0 +1,15 @@
+--- a/src/BatchedContext.cpp
++++ b/src/BatchedContext.cpp
+@@ -2002,7 +2002,11 @@
+             m_FreeBatches.emplace_back(std::move(m_QueuedBatches.front()));
+             m_QueuedBatches.pop_front();
+ 
+-            m_ImmCtx.Flush(FlushRequestedMask);
++            // Flush errors occur outside ProcessBatchImpl's catch. Preserve the
++            // first failure and still signal batch consumption so the caller can report it.
++            try { m_ImmCtx.Flush(FlushRequestedMask); }
++            catch (_com_error& error) { m_Callbacks.ThreadErrorCallback(error.Error()); }
++            catch (std::bad_alloc&) { m_Callbacks.ThreadErrorCallback(E_OUTOFMEMORY); }
+         }
+ 
+         BOOL value = ReleaseSemaphore(m_BatchConsumedSemaphore, 1, nullptr);

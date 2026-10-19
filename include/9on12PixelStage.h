@@ -46,7 +46,7 @@ namespace D3D9on12
         D3D12PixelShader* GetCurrentD3D12PixelShader() { return m_pCurrentD3D12PixelShader; }
 
         PixelShader* GetCurrentD3D9PixelShader() { return m_pCurrentPS; }
-        void MarkSRVIndicesDirty(const std::vector<UINT> &indices);
+        void MarkSRVIndicesDirty(UINT bindingMask);
 
     private: // Types
         struct SamplerCache

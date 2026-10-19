@@ -15,7 +15,6 @@ namespace D3D9on12
                 UINT PSExtension : 1;
                 UINT PSExtension2 : 1;
                 UINT PSExtension3 : 1;
-                UINT VertexBuffers : 1;
                 UINT IndexBuffer : 1;
                 UINT Samplers : MAX_SAMPLERS_STAGES;
                 UINT Textures : MAX_SAMPLERS_STAGES;
@@ -24,7 +23,7 @@ namespace D3D9on12
 
         union
         {
-            UINT64 PSOFlags;
+            UINT PSOFlags;
             struct
             {
                 UINT RenderTargets : MAX_RENDER_TARGETS;
@@ -42,6 +41,9 @@ namespace D3D9on12
             };
         };
 
+        // A real stream mask, outside the PSO flags: VB-only changes must not
+        // trigger PSO lookups. Keep all hot fields native-sized on x86.
+        UINT VertexBuffers;
 
         PipelineStateDirtyFlags()
         {
@@ -52,7 +54,8 @@ namespace D3D9on12
         void Clear()
         {
             memset(&MiscFlags, 0, sizeof(MiscFlags));
-            memset(&PSOFlags, 0, sizeof(MiscFlags));
+            PSOFlags = 0;
+            VertexBuffers = 0;
         }
 
         bool IsPSOChangeRequired()
@@ -257,6 +260,14 @@ namespace D3D9on12
             MaxMipLevel(0),
             MipLODBias(0.0f)
         {
+            // A shader can declare a sampler before the runtime sends every field.
+            // D3D12 requires even unused dimensions to have a valid address mode.
+            MagFilter = D3DTEXF_POINT;
+            MinFilter = D3DTEXF_POINT;
+            AddressU = D3DTADDRESS_WRAP;
+            AddressV = D3DTADDRESS_WRAP;
+            AddressW = D3DTADDRESS_WRAP;
+            MaxAnisotropy = 1;
             C_ASSERT(sizeof(SamplerStateID) == sizeof(Flags) +
                 sizeof(BorderColor) +
                 sizeof(MaxMipLevel) +

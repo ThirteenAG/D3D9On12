@@ -97,7 +97,7 @@ namespace D3D9on12
 
         if (SUCCEEDED(hr))
         {
-            pDevice->GetContext().DrawInstanced(
+            pDevice->GetRenderContext().DrawInstanced(
                 CalcVertexCount(pDrawPrimitiveArg->PrimitiveType, pDrawPrimitiveArg->PrimitiveCount),
                 instanceCount,
                 baseVertexOffset.GetOffsetInVertices(),
@@ -143,7 +143,7 @@ namespace D3D9on12
 
         if (SUCCEEDED(hr))
         {
-            pDevice->GetContext().DrawInstanced(vertexCount,
+            pDevice->GetRenderContext().DrawInstanced(vertexCount,
                 instanceCount,
                 0,// offset will be added in the vertex buffer resolve
                 0);
@@ -211,7 +211,7 @@ namespace D3D9on12
 
             if (SUCCEEDED(hr))
             {
-                pDevice->GetContext().DrawIndexedInstanced(indexCount,
+                pDevice->GetRenderContext().DrawIndexedInstanced(indexCount,
                     instanceCount,
                     0,// offset will be added in the index buffer resolve,
                     drawOffset.GetOffsetInVertices(),
@@ -289,7 +289,7 @@ namespace D3D9on12
                 break;
             }
 
-            GetContext().DrawIndexedInstanced(indexCount,
+            GetRenderContext().DrawIndexedInstanced(indexCount,
                 instanceCount,
                 baseIndexOffset.GetOffsetInIndices(),
                 baseVertexVal,
@@ -360,7 +360,7 @@ namespace D3D9on12
                 break;
             }
 
-            GetContext().DrawIndexedInstanced(indexCount,
+            GetRenderContext().DrawIndexedInstanced(indexCount,
                 instanceCount,
                 baseIndexOffset.GetOffsetInIndices(),
                 baseVertexVal,
@@ -442,7 +442,7 @@ namespace D3D9on12
                 break;
             }
 
-            GetContext().DrawIndexedInstanced(indexCount,
+            GetRenderContext().DrawIndexedInstanced(indexCount,
                 instanceCount,
                 0,
                 baseVertexVal,
@@ -494,7 +494,7 @@ namespace D3D9on12
 
             if (SUCCEEDED(hr))
             {
-                pDevice->GetContext().DrawIndexedInstanced(
+                pDevice->GetRenderContext().DrawIndexedInstanced(
                     IndexCountPerInstance,
                     instanceCount,
                     baseIndexOffset.GetOffsetInIndices(),

@@ -147,14 +147,23 @@ namespace D3D9on12
             else
             {
                 // Fallback to old present path
-                auto swapChainManager = GetSwapChainManager();
-                D3D12TranslationLayer::Resource* pSrcTranslationLayerResource = pSource->GetUnderlyingResource();
+                if (pSource->GetVidPnSourceId() != D3DDDI_ID_UNINITIALIZED || pKMTArgs->hWindow == nullptr)
+                {
+                    // A primary (exclusive fullscreen): no window to attach a swap chain to; the kernel flip
+                    // goes through the D3D12 runtime's private present interfaces.
+                    hr = PrivatePresent(pSource, presentSurfaces[0].SubResourceIndex, pKMTArgs);
+                }
+                else
+                {
+                    auto swapChainManager = GetSwapChainManager();
+                    D3D12TranslationLayer::Resource* pSrcTranslationLayerResource = pSource->GetUnderlyingResource();
 
-                auto pSwapChain = swapChainManager->GetSwapChainForWindow(pKMTArgs->hWindow, *pSrcTranslationLayerResource);
-                auto swapChainHelper = D3D12TranslationLayer::SwapChainHelper(pSwapChain);
-                GetContext().m_MaxFrameLatencyHelper.WaitForMaximumFrameLatency();
+                    auto pSwapChain = swapChainManager->GetSwapChainForWindow(pKMTArgs->hWindow, *pSrcTranslationLayerResource);
+                    auto swapChainHelper = D3D12TranslationLayer::SwapChainHelper(pSwapChain);
+                    GetContext().m_MaxFrameLatencyHelper.WaitForMaximumFrameLatency();
 
-                hr = swapChainHelper.StandardPresent(GetContext(), pKMTArgs, *pSrcTranslationLayerResource);
+                    hr = swapChainHelper.StandardPresent(GetContext(), pKMTArgs, *pSrcTranslationLayerResource);
+                }
             }
             
             m_lockedResourceRanges.GetLocked()->clear();
@@ -165,6 +174,118 @@ namespace D3D9on12
         {
             return E_INVALIDARG;
         }
+    }
+
+
+    bool Device::SupportsPrivatePresent()
+    {
+        if (m_privatePresentState == 0)
+        {
+            ID3D12CommandQueue* pQueue = m_pImmediateContext->GetCommandQueue(D3D12TranslationLayer::COMMAND_LIST_TYPE::GRAPHICS);
+            ID3D12GraphicsCommandList* pList = m_pImmediateContext->GetGraphicsCommandList();
+            CComPtr<ID3D12CommandQueuePrivatePresent> pQueuePresent;
+            CComPtr<ID3D12CommandListPresent> pListPresent;
+            const bool available = pQueue != nullptr && pList != nullptr &&
+                SUCCEEDED(pQueue->QueryInterface(&pQueuePresent)) && SUCCEEDED(pList->QueryInterface(&pListPresent));
+            m_pPrivateQueuePresent = available ? pQueuePresent : nullptr;
+            m_privatePresentState = available ? 1 : 2;
+        }
+        return m_privatePresentState == 1;
+    }
+
+    // Mirrors Windows' in-box driver (D3D12TranslationLayer::ImmediateContextInternal::Present): transition the
+    // surface to PRESENT, let the command list record the driver's present DDI and fill the present data, execute,
+    // then let the queue submit the kernel present from the runtime's D3DKMT_PRESENT.
+    HRESULT Device::PrivatePresent(Resource* pSource, UINT subresource, D3DKMT_PRESENT* pKMTArgs)
+    {
+        if (!SupportsPrivatePresent())
+        {
+            return E_NOTIMPL;
+        }
+        D3D12TranslationLayer::ImmediateContext& context = GetContext();
+        const auto graphics = D3D12TranslationLayer::COMMAND_LIST_TYPE::GRAPHICS;
+        if (!pKMTArgs->Flags.RedirectedFlip)
+        {
+            context.m_MaxFrameLatencyHelper.WaitForMaximumFrameLatency();
+        }
+
+        D3D12TranslationLayer::Resource* pResource = pSource->GetUnderlyingResource();
+        for (UINT plane = 0; plane < pResource->AppDesc()->NonOpaquePlaneCount(); ++plane)
+        {
+            const UINT planeSubresource = D3D12TranslationLayer::ConvertSubresourceIndexAddPlane(subresource, pResource->AppDesc()->SubresourcesPerPlane(), plane);
+            context.GetResourceStateManager().TransitionSubresource(pResource, planeSubresource, D3D12_RESOURCE_STATE_PRESENT, graphics,
+                D3D12TranslationLayer::SubresourceTransitionFlags::StateMatchExact);
+        }
+        context.GetResourceStateManager().ApplyAllResourceTransitions();
+
+        CComPtr<ID3D12CommandListPresent> pListPresent;
+        ThrowFailure(context.GetGraphicsCommandList()->QueryInterface(&pListPresent));
+
+        D3D12_PRIVATE_PRESENT present = {};
+        present.Flags = 1;
+        present.VidPnSourceId = pSource->GetVidPnSourceId() != D3DDDI_ID_UNINITIALIZED ? pSource->GetVidPnSourceId() : pKMTArgs->VidPnSourceId;
+        D3D12_PRIVATE_PRESENTSURFACE surface = { pResource->GetUnderlyingResource(), subresource };
+        BOOL commandsAdded = FALSE;
+        pListPresent->Present(context.GetCommandQueue(graphics), &surface, 1, nullptr, nullptr, 0,
+            pKMTArgs->Flags.Flip ? D3D12_PRIVATE_PRESENT_FLAG_FLIP : D3D12_PRIVATE_PRESENT_FLAG_BLT,
+            (UINT)pKMTArgs->FlipInterval, &commandsAdded, &present);
+        if (commandsAdded)
+        {
+            context.AdditionalCommandsAdded(graphics);
+        }
+        context.Flush(D3D12TranslationLayer::COMMAND_LIST_TYPE_GRAPHICS_MASK);
+
+        const UINT64 commandListID = context.GetCommandListID(graphics);
+        pResource->UsedInCommandList(graphics, commandListID);
+        if (!pKMTArgs->Flags.RedirectedFlip)
+        {
+            // The frame's GPU work is in the lists submitted so far (the open list is empty after the flush). The
+            // runtime polls IsMaximumFrameLatencyReached before each D3DPRESENT_DONOTWAIT present and answers
+            // D3DERR_WASSTILLDRAWING without calling the driver while it is reached; recording the open list's
+            // ID would never complete when the application presents without rendering, and the game's retry
+            // loop would spin for ever.
+            context.m_MaxFrameLatencyHelper.RecordPresentFenceValue(commandListID - 1);
+        }
+        HRESULT hr = m_pPrivateQueuePresent->SubmitPresent(pKMTArgs, &present);
+        context.PrepForCommandQueueSync(D3D12TranslationLayer::COMMAND_LIST_TYPE_GRAPHICS_MASK);
+        return hr;
+    }
+
+    bool Device::IsPresentLatencyReached()
+    {
+        auto& latency = GetFrameLatencyHelper();
+        bool reached = latency.IsMaximumFrameLatencyReached();
+        if (reached)
+        {
+            // The runtime refuses D3DPRESENT_DONOTWAIT presents while this is true and the application may stop
+            // submitting work until a present succeeds: put everything recorded so far on the GPU so the outstanding
+            // presents can complete.
+            GetContextNoDrain().Flush(D3D12TranslationLayer::COMMAND_LIST_TYPE_GRAPHICS_MASK);
+            reached = latency.IsMaximumFrameLatencyReached();
+        }
+        if (!reached)
+        {
+            m_latencyReachedSinceQpc = 0;
+            return false;
+        }
+        // Still reached: the GPU has not finished the recorded work. A queue stuck behind a wait that never
+        // completes (a client's fence, a lost device) must not become an endless D3DERR_WASSTILLDRAWING; after a
+        // bounded time the latency gate opens and the present proceeds (or fails) on its own.
+        LARGE_INTEGER now = {}, frequency = {};
+        QueryPerformanceCounter(&now);
+        QueryPerformanceFrequency(&frequency);
+        if (m_latencyReachedSinceQpc == 0)
+        {
+            m_latencyReachedSinceQpc = now.QuadPart;
+            return true;
+        }
+        const LONGLONG elapsedMs = (now.QuadPart - m_latencyReachedSinceQpc) * 1000 / std::max<LONGLONG>(frequency.QuadPart, 1);
+        if (elapsedMs < 2000)
+        {
+            return true;
+        }
+        m_latencyReachedSinceQpc = 0;
+        return false;
     }
 
     std::shared_ptr<D3D12TranslationLayer::SwapChainManager> Device::GetSwapChainManager()

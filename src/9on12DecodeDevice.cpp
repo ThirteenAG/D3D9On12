@@ -147,6 +147,9 @@ namespace D3D9on12
 
     DecodeDevice::~DecodeDevice()
     {
+#if defined(D3D9ON12_BATCHED_RENDERING)
+        m_pParentDevice->GetContextForDestruction();
+#endif
         if (m_pUnderlyingVideoDecode)
         {
             m_pUnderlyingVideoDecode->~VideoDecode();
@@ -175,6 +178,9 @@ namespace D3D9on12
     {
         if (pExtensionExecute->Function == DXVA_STATUS_REPORTING_FUNCTION)
         {
+#if defined(D3D9ON12_BATCHED_RENDERING)
+            m_pParentDevice->GetContext();
+#endif
             return m_pUnderlyingVideoDecode->GetDecodingStatus(pExtensionExecute->pPrivateOutput->pData, pExtensionExecute->pPrivateOutput->DataSize);
         }
 
@@ -248,6 +254,10 @@ namespace D3D9on12
     {
         --m_frameNestCount;
 
+#if defined(D3D9ON12_BATCHED_RENDERING)
+        // Video submissions mutate shared queue/resource state: order them after queued graphics.
+        m_pParentDevice->GetContext();
+#endif
         m_pUnderlyingVideoDecode->DecodeFrame(&m_inputArguments, &m_outputArguments);
 
         // now unmap frame arguments

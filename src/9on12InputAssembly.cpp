@@ -6,7 +6,7 @@ namespace D3D9on12
 {
     _Check_return_ HRESULT APIENTRY SetStreamSource(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETSTREAMSOURCE *pStreamSourceArg)
     {
-        D3D9on12_DDI_ENTRYPOINT_START(TRUE);
+        D3D9ON12_CPU_SETTER_ENTRYPOINT();
         Device* pDevice = Device::GetDeviceFromHandle(hDevice);
         if (pDevice == nullptr || pStreamSourceArg == nullptr || pStreamSourceArg->Stream >= MAX_VERTEX_STREAMS)
         {
@@ -17,12 +17,12 @@ namespace D3D9on12
         InputAssembly& ia = pDevice->GetPipelineState().GetInputAssembly();
         HRESULT hr = ia.SetVertexBuffer(*pDevice, pResource, pStreamSourceArg->Stream, pStreamSourceArg->Offset, pStreamSourceArg->Stride);
 
-        D3D9on12_DDI_ENTRYPOINT_END_AND_RETURN_HR(hr);
+        return hr;
     }
 
     _Check_return_ HRESULT APIENTRY SetStreamSourceUM(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETSTREAMSOURCEUM* pStreamSourceArg, _In_ CONST VOID* pData)
     {
-        D3D9on12_DDI_ENTRYPOINT_START(TRUE);
+        D3D9ON12_CPU_SETTER_ENTRYPOINT();
         Device* pDevice = Device::GetDeviceFromHandle(hDevice);
         if (pDevice == nullptr || pStreamSourceArg == nullptr || pData == nullptr || pStreamSourceArg->Stream >= MAX_VERTEX_STREAMS)
         {
@@ -32,12 +32,12 @@ namespace D3D9on12
         InputAssembly& ia = pDevice->GetPipelineState().GetInputAssembly();
         ia.SetVertexBufferUM(*pDevice, pStreamSourceArg->Stream, pStreamSourceArg->Stride, pData);
 
-        D3D9on12_DDI_ENTRYPOINT_END_AND_RETURN_HR(S_OK);
+        return S_OK;
     }
 
     _Check_return_ HRESULT APIENTRY SetIndices(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETINDICES* pSetIndicesArg)
     {
-        D3D9on12_DDI_ENTRYPOINT_START(TRUE);
+        D3D9ON12_CPU_SETTER_ENTRYPOINT();
         Device* pDevice = Device::GetDeviceFromHandle(hDevice);
         if (pDevice == nullptr || pSetIndicesArg == nullptr)
         {
@@ -46,12 +46,12 @@ namespace D3D9on12
 
         Resource *pResource = Resource::GetResourceFromHandle(pSetIndicesArg->hIndexBuffer);
         HRESULT hr = pDevice->GetPipelineState().GetInputAssembly().SetIndexBuffer(*pDevice, pResource, pSetIndicesArg->Stride);
-        D3D9on12_DDI_ENTRYPOINT_END_AND_RETURN_HR(hr);
+        return hr;
     }
 
     _Check_return_ HRESULT APIENTRY SetIndicesUM(_In_ HANDLE hDevice, _In_ UINT indexBufferStride, _In_ CONST VOID*pIndices)
     {
-        D3D9on12_DDI_ENTRYPOINT_START(TRUE);
+        D3D9ON12_CPU_SETTER_ENTRYPOINT();
         Device* pDevice = Device::GetDeviceFromHandle(hDevice);
         if (pDevice == nullptr)
         {
@@ -59,7 +59,7 @@ namespace D3D9on12
         }
 
         HRESULT hr = pDevice->GetPipelineState().GetInputAssembly().SetIndexBufferUM(*pDevice, indexBufferStride, pIndices);
-        D3D9on12_DDI_ENTRYPOINT_END_AND_RETURN_HR(hr);
+        return hr;
     }
 
     InputAssembly::InputAssembly(PipelineStateDirtyFlags& pipelineStateDirtyFlags, RasterStatesWrapper& rasterStates) :
@@ -73,7 +73,7 @@ namespace D3D9on12
         m_IndexBufferStack.push(InputBuffer());
     };
 
-    void InputBuffer::InitWithUploadData(Device& /*device*/, UINT strideInBytes, CONST VOID* pDataToUpload)
+    void InputBuffer::InitWithUploadData(Device& /*device*/, UINT strideInBytes, CONST VOID* pDataToUpload) noexcept
     {
         *this = InputBuffer(); // Initialize defaults
         m_isSystemMemory = (pDataToUpload != nullptr);
@@ -81,18 +81,35 @@ namespace D3D9on12
         m_bufferStride = strideInBytes;
     }
 
-    void InputBuffer::InitWithResource(Device& /*device*/, Resource* pAppResource, UINT64 bufferSize, UINT64 offset, UINT strideInBytes)
+    void InputBuffer::InitWithResource(Device& /*device*/, Resource* pAppResource, UINT64 offset, UINT strideInBytes) noexcept
     {
-        *this = InputBuffer(); // Initialize defaults
-        m_sizeInBytes = static_cast<UINT>(bufferSize);
+        // Persistent app buffers own no upload or triangle-fan allocation. Their
+        // frequent rebindings only need to replace the resource and view fields.
+        // UP/system-memory and triangle-fan inputs must release/reset that state.
+        if (m_isSystemMemory)
+        {
+            *this = InputBuffer();
+        }
+        Check9on12(!m_isTriangleFanIndexBuffer && !m_pInternallyProvidedResource);
+        Check9on12(!m_gpuBuffer.m_pMappedAddress && m_gpuBuffer.m_offsetFromBase == 0);
         m_bufferStride = strideInBytes;
         m_bufferOffset = (UINT)offset;
         m_pAppProvidedResource = pAppResource;
+        if (pAppResource) pAppResource->NoteGpuUse();
 
-        if (pAppResource && pAppResource->IsSystemMemory())
+        // Resource creation supplies a stable TL object for every non-system IA
+        // buffer. Discard only renames its backing identity. Bind cleanup clears
+        // this borrowed pointer before resource destruction.
+        auto* underlying = pAppResource ? pAppResource->GetUnderlyingResource() : nullptr;
+        assert(!pAppResource || pAppResource->IsSystemMemory() == !underlying);
+        m_gpuBuffer.m_pResource = underlying;
+        if (pAppResource && !underlying)
         {
             // System memory resources must be versioned and uploaded before each draw
             m_isSystemMemory = true;
+            // Only CPU uploads use this bound. Persistent buffers need no
+            // descriptor-width read on each mesh binding.
+            m_sizeInBytes = static_cast<UINT>(pAppResource->GetDesc().Width);
             m_pDeferredSystemMemoryData = pAppResource->GetSystemMemoryBase();
         }
         else
@@ -111,16 +128,20 @@ namespace D3D9on12
         D3D12TranslationLayer::ResourceCreationArgs args = GetCreateUploadBufferArgs(&device.GetDevice(), (size_t)bufferSize, 0);
         m_pInternallyProvidedResource.reset(
             D3D12TranslationLayer::Resource::CreateResource(&device.GetContext(), args, D3D12TranslationLayer::ResourceAllocationContext::ImmediateContextThreadLongLived).release(),
+#if defined(D3D9ON12_BATCHED_RENDERING)
+            CleanupBatchedInputResourceAndRelease{ &device });
+#else
             CleanupResourceBindingsAndRelease{});
-        m_tempGPUBuffer.m_pResource = m_pInternallyProvidedResource.get();
+#endif
+        m_gpuBuffer.m_pResource = m_pInternallyProvidedResource.get();
 
         D3D12TranslationLayer::MappedSubresource MappedResult;
-        device.GetContext().Map(m_tempGPUBuffer.m_pResource, 0, D3D12TranslationLayer::MAP_TYPE_WRITE, false, nullptr, &MappedResult);
+        device.GetContext().Map(m_gpuBuffer.m_pResource, 0, D3D12TranslationLayer::MAP_TYPE_WRITE, false, nullptr, &MappedResult);
 
-        m_tempGPUBuffer.m_pMappedAddress = (byte*)MappedResult.pData;
-        m_tempGPUBuffer.m_offsetFromBase = 0;
+        m_gpuBuffer.m_pMappedAddress = (byte*)MappedResult.pData;
+        m_gpuBuffer.m_offsetFromBase = 0;
 
-        m_pDeferredSystemMemoryData = m_tempGPUBuffer.m_pMappedAddress;
+        m_pDeferredSystemMemoryData = m_gpuBuffer.m_pMappedAddress;
         m_isTriangleFanIndexBuffer = true;
         m_isSystemMemory = true;
         m_bufferStride = strideInBytes;
@@ -128,33 +149,11 @@ namespace D3D9on12
         m_bufferOffset = 0;
     }
 
-    D3D12TranslationLayer::Resource * InputBuffer::GetUnderlyingResource() 
-    {
-        if (m_isSystemMemory)
-        {
-            // Can be null if this VB is not referenced by the input layout and we choose
-            // not to upload
-            return m_tempGPUBuffer.m_pResource;
-        }
-        else if (m_pAppProvidedResource)
-        {
-            Check9on12(m_pInternallyProvidedResource == nullptr);
-            return m_pAppProvidedResource->GetUnderlyingResource();
-        }
-        else
-        {
-            Check9on12(m_pInternallyProvidedResource == nullptr &&
-                       m_pAppProvidedResource == nullptr &&
-                       m_tempGPUBuffer.m_pResource == nullptr);
-            return nullptr;
-        }
-    }
-
     UINT InputBuffer::GetOffsetInBytesD3D12()
     {         
         if (m_isSystemMemory)
         {
-            return static_cast<UINT>(m_tempGPUBuffer.m_offsetFromBase);
+            return static_cast<UINT>(m_gpuBuffer.m_offsetFromBase);
         }
         else
         {
@@ -193,44 +192,38 @@ namespace D3D9on12
 
         const UINT32 drawSize = vertexCount * m_bufferStride;
 
-        m_tempGPUBuffer = device.GetSystemMemoryAllocator().Allocate(drawOffset + drawSize);
+        m_gpuBuffer = device.GetSystemMemoryAllocator().Allocate(drawOffset + drawSize);
 
         UINT32 maxCopySize = m_sizeInBytes - drawOffset;
-        memcpy((byte*)m_tempGPUBuffer.m_pMappedAddress + drawOffset, (byte*)GetSystemMemoryBase() + drawOffset, min(drawSize, maxCopySize));
+        memcpy((byte*)m_gpuBuffer.m_pMappedAddress + drawOffset, (byte*)GetSystemMemoryBase() + drawOffset, min(drawSize, maxCopySize));
 
         return S_OK;
     }
 
-    HRESULT InputAssembly::SetIndexBuffer(Device &device, Resource *pResource, UINT stride)
+    HRESULT InputAssembly::SetIndexBuffer(Device &device, Resource *pResource, UINT stride) noexcept
     {
         Resource *pPrevResource = CurrentIndexBuffer().GetAppResource();
         if (pPrevResource != pResource || stride != CurrentIndexBuffer().GetStrideInBytes())
         {
-            if (pPrevResource)
+            if (pResource && pPrevResource == pResource && !CurrentIndexBuffer().IsSystemMemory())
             {
-                pPrevResource->GetIBBindingTracker().Unbind(0);
+                CurrentIndexBuffer().UpdatePersistentView(0, stride);
+                m_dirtyFlags.IndexBuffer = true;
+                return S_OK;
             }
-            if (pResource)
-            {
-                pResource->GetIBBindingTracker().Bind(0);
-            }
-
-            UINT64 bufferSize = pResource ? pResource->GetDesc().Width : 0;
-            CurrentIndexBuffer().InitWithResource(device, pResource, bufferSize, 0, stride);
+            if (pPrevResource) pPrevResource->GetIBBindingTracker().Unbind(0);
+            if (pResource) pResource->GetIBBindingTracker().Bind(0);
+            CurrentIndexBuffer().InitWithResource(device, pResource, 0, stride);
             m_dirtyFlags.IndexBuffer = true;
         }
 
         return S_OK;
     }
 
-    HRESULT InputAssembly::SetIndexBufferUM(Device &device, UINT indexBufferStride, CONST VOID*pIndices)
+    HRESULT InputAssembly::SetIndexBufferUM(Device &device, UINT indexBufferStride, CONST VOID*pIndices) noexcept
     {
-        Resource *pPrevResource = CurrentIndexBuffer().GetAppResource();
-        if (pPrevResource)
-        {
-            pPrevResource->GetIBBindingTracker().Unbind(0);
-        }
-
+        Resource* previous = CurrentIndexBuffer().GetAppResource();
+        if (previous) previous->GetIBBindingTracker().Unbind(0);
         CurrentIndexBuffer().InitWithUploadData(device, indexBufferStride, pIndices);
         m_dirtyFlags.IndexBuffer = true;
 
@@ -322,7 +315,7 @@ namespace D3D9on12
         HRESULT hr = S_OK;
         if (m_dirtyFlags.Topology)
         {
-            device.GetContext().IaSetTopology(m_topology);
+            device.GetRenderContext().IaSetTopology(m_topology);
         }
         if (m_dirtyFlags.VertexBuffers)
         {
@@ -340,7 +333,7 @@ namespace D3D9on12
             // Please note that if the offset is not expressed in bytes, then aditionalOffset is zero.
 
             INT aditionalOffset = (BaseIndexStart.m_type == OffsetType::OFFSET_IN_BYTES) ? BaseIndexStart.GetOffsetInBytes() : 0;
-            device.GetContext().IaSetIndexBuffer(ib.GetUnderlyingResource(), ibFormat, ib.GetOffsetInBytesD3D12() + aditionalOffset);
+            device.GetRenderContext().IaSetIndexBuffer(ib.GetUnderlyingResource(), ibFormat, ib.GetOffsetInBytesD3D12() + aditionalOffset);
         }
         return hr;
     }
@@ -365,9 +358,9 @@ namespace D3D9on12
 
     void InputAssembly::ResolveVertexBuffers(Device& device, OffsetArg BaseVertexStart)
     {
-        D3D12TranslationLayer::Resource * vbs[MAX_VERTEX_STREAMS] = {};
-        UINT offsets[MAX_VERTEX_STREAMS] = {};
-        UINT strides[MAX_VERTEX_STREAMS] = {};
+        D3D12TranslationLayer::Resource * vbs[MAX_VERTEX_STREAMS];
+        UINT offsets[MAX_VERTEX_STREAMS];
+        UINT strides[MAX_VERTEX_STREAMS];
         
         // To support multithreading we must support the case when the offset passed by argument is in bytes instead of vertices. Since Dx12 does not support draw offsets in bytes
         // we add the aditional offset here, and then call draw* with zero offset.
@@ -379,47 +372,41 @@ namespace D3D9on12
 
         INT aditionalOffset = (BaseVertexStart.m_type == OffsetType::OFFSET_IN_BYTES) ? BaseVertexStart.GetOffsetInBytes() : 0;
         
-        size_t vbIndex = 0;
-        
-        vbs[vbIndex] = m_inputStreams[vbIndex].GetUnderlyingResource();
-        strides[vbIndex] = m_inputStreams[vbIndex].GetStrideInBytes();
-        offsets[vbIndex] = m_inputStreams[vbIndex].GetOffsetInBytesD3D12() + aditionalOffset;
-
-        for (vbIndex = 1; vbIndex < MAX_VERTEX_STREAMS; vbIndex++)
+        // Emit contiguous dirty runs, including slots that were just unbound.
+        // m_numBoundVBs cannot bound this loop: it already excludes those slots.
+        UINT dirtyStreams = static_cast<UINT>(m_dirtyFlags.VertexBuffers);
+        while (dirtyStreams)
         {
-            vbs[vbIndex] = m_inputStreams[vbIndex].GetUnderlyingResource();
-            strides[vbIndex] = m_inputStreams[vbIndex].GetStrideInBytes();
-            offsets[vbIndex] = m_inputStreams[vbIndex].GetOffsetInBytesD3D12();
+            ULONG first;
+            BitScanForward(&first, dirtyStreams);
+            UINT end = first;
+            do
+            {
+                vbs[end] = m_inputStreams[end].GetUnderlyingResource();
+                strides[end] = m_inputStreams[end].GetStrideInBytes();
+                offsets[end] = m_inputStreams[end].GetOffsetInBytesD3D12() + (end == 0 ? aditionalOffset : 0);
+                dirtyStreams &= ~BIT(end);
+                ++end;
+            } while (end < MAX_VERTEX_STREAMS && (dirtyStreams & BIT(end)));
+            device.GetRenderContext().IaSetVertexBuffers(first, end - first, vbs + first, strides + first, offsets + first);
         }
-
-        if (m_numBoundVBs == 0)
-        {
-            // clear out all streams
-            m_numBoundVBs = MAX_VERTEX_STREAMS;
-        }
-
-        device.GetContext().IaSetVertexBuffers(0, m_numBoundVBs, vbs, strides, offsets);
-    }
-
-    bool InputAssembly::InputBufferNeedsUpload(UINT streamIndex)
-    {
-        Check9on12(streamIndex < MAX_VERTEX_STREAMS);
-        return m_inputStreams[streamIndex].IsSystemMemory() && (m_pInputLayout->GetStreamMask() & BIT(streamIndex)) != 0;
     }
 
     void InputBuffer::ResetUploadedData()
     {
         if (IsSystemMemory())
         {
-            m_tempGPUBuffer = {};
+            m_gpuBuffer = {};
         }
     }
 
 
     void InputAssembly::ResetUploadBufferData()
     {
-        for (UINT index = 0; index < MAX_VERTEX_STREAMS; index++)
+        for (UINT streams = m_systemMemoryStreams; streams; streams &= streams - 1)
         {
+            ULONG index;
+            BitScanForward(&index, streams);
             m_inputStreams[index].ResetUploadedData();
         }
         CurrentIndexBuffer().ResetUploadedData();
@@ -430,37 +417,17 @@ namespace D3D9on12
     {
         HRESULT hr = S_OK;
 
-        auto& inputStream = m_inputStreams[0];
-
-        if (InputBufferNeedsUpload(0))
-        {
-            hr = inputStream.Upload(device, baseVertexIndex, vertexCount);
-
-            m_dirtyFlags.VertexBuffers |= BIT(0);
-        }
-        
         // If the offset was set in bytes, it only referenced the stream number zero. We can assume the other streams have zero offset.
         const OffsetArg zeroOffset = OffsetArg::AsOffsetInBytes(0);
         const OffsetArg &realOffset = (baseVertexIndex.m_type == OffsetType::OFFSET_IN_BYTES) ? zeroOffset : baseVertexIndex;
 
-        if (SUCCEEDED(hr))
+        for (UINT streams = m_systemMemoryStreams & m_pInputLayout->GetStreamMask(); streams; streams &= streams - 1)
         {
-            for (UINT index = 1; index < MAX_VERTEX_STREAMS; index++)
-            {
-                if (InputBufferNeedsUpload(index))
-                {
-                    hr = m_inputStreams[index].Upload(device, realOffset, vertexCount);
-
-                    m_dirtyFlags.VertexBuffers |= BIT(index);
-                }
-
-                if (FAILED(hr))
-                {
-                    break;
-                }
-
-                index++;
-            }
+            ULONG index;
+            BitScanForward(&index, streams);
+            hr = m_inputStreams[index].Upload(device, index == 0 ? baseVertexIndex : realOffset, vertexCount);
+            m_dirtyFlags.VertexBuffers |= BIT(index);
+            if (FAILED(hr)) break;
         }
 
         if (SUCCEEDED(hr) && indexCount > 0)
@@ -501,40 +468,42 @@ namespace D3D9on12
         {
             m_topology = newTopology;
             device.GetPipelineState().CurrentPSODesc().PrimitiveTopologyType = ConvertToD3D12TopologyType(m_topology);
-            device.GetContext().IaSetTopology(m_topology);
+            device.GetRenderContext().IaSetTopology(m_topology);
         }
         m_rasterStates.SetPrimitiveType(primitiveType);
     }
 
-    void InputAssembly::SetVertexBufferUM(Device& device, UINT vbSlot, UINT stride, _In_ CONST VOID* pData)
+    void InputAssembly::SetVertexBufferUM(Device& device, UINT vbSlot, UINT stride, _In_ CONST VOID* pData) noexcept
     {
-        Resource* pPrevResource = m_inputStreams[vbSlot].GetAppResource();
-        if (pPrevResource)
-        {
-            pPrevResource->GetVBBindingTracker().Unbind(vbSlot);
-        }
-
+        Resource* previous = m_inputStreams[vbSlot].GetAppResource();
+        if (previous) previous->GetVBBindingTracker().Unbind(vbSlot);
         m_inputStreams[vbSlot].InitWithUploadData(device, stride, pData);
+        if (pData) m_systemMemoryStreams |= BIT(vbSlot);
+        else m_systemMemoryStreams &= ~BIT(vbSlot);
 
         m_numBoundVBs = max(m_numBoundVBs, vbSlot + 1);
 
-        m_dirtyFlags.VertexBuffers = true;
+        m_dirtyFlags.VertexBuffers |= BIT(vbSlot);
     }
 
-    HRESULT InputAssembly::SetVertexBuffer(Device &device, Resource *pResource, UINT vbSlot, UINT offset, UINT stride)
+    HRESULT InputAssembly::SetVertexBuffer(Device &device, Resource *pResource, UINT vbSlot, UINT offset, UINT stride) noexcept
     {
         HRESULT hr = S_OK;
-        const UINT64 bufferSize = pResource ? pResource->GetDesc().Width : 0;
 
         InputBuffer &inputBuffer = m_inputStreams[vbSlot];
         Resource* pPrevResource = m_inputStreams[vbSlot].GetAppResource();
         if (pPrevResource != pResource || m_inputStreams[vbSlot].GetStrideInBytes() != stride || inputBuffer.GetOffsetInBytesAPI() != offset)
         {
-            if (pPrevResource)
+            // Offset/stride changes do not change resource membership. In
+            // particular, meshes sharing a persistent VB need only a new view.
+            // System-memory inputs still refresh their CPU upload source.
+            if (pResource && pPrevResource == pResource && !inputBuffer.IsSystemMemory())
             {
-                pPrevResource->GetVBBindingTracker().Unbind(vbSlot);
+                inputBuffer.UpdatePersistentView(offset, stride);
+                m_dirtyFlags.VertexBuffers |= BIT(vbSlot);
+                return S_OK;
             }
-
+            if (pPrevResource) pPrevResource->GetVBBindingTracker().Unbind(vbSlot);
             if (pResource)
             {
                 pResource->GetVBBindingTracker().Bind(vbSlot);
@@ -554,11 +523,14 @@ namespace D3D9on12
                 }
             }
 
-            m_inputStreams[vbSlot].InitWithResource(device, pResource, bufferSize, offset, stride);
-            m_dirtyFlags.VertexBuffers = true;
+            m_inputStreams[vbSlot].InitWithResource(device, pResource, offset, stride);
+            if (m_inputStreams[vbSlot].IsSystemMemory()) m_systemMemoryStreams |= BIT(vbSlot);
+            else m_systemMemoryStreams &= ~BIT(vbSlot);
+            m_dirtyFlags.VertexBuffers |= BIT(vbSlot);
         }
 
         CHECK_HR(hr);
         return hr;
     }
+
 };

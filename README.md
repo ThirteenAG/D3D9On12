@@ -1,5 +1,23 @@
 # D3D9On12
 
+This fork maintains the D3D9-to-D3D12 mapping layer with correctness and CPU
+performance improvements, reproducible dependency patches, and runtime regression
+probes. It is an independent fork of Microsoft's MIT-licensed project.
+
+Release archives contain `d3d9on12.dll`, its matching `dxbcSigner.dll`, dependency
+licenses, and build metadata. Win32 targets 32-bit applications; x64 targets 64-bit
+applications. An application or loader must select D3D9On12 through
+`Direct3DCreate9On12` or `Direct3DCreate9On12Ex` and load the application-local
+mapping layer. Copying these files alone does not redirect ordinary D3D9 calls.
+Keep Windows' system copies unchanged.
+
+The release configuration includes sampler validation, SYSTEMMEM buffer upload
+corrections, query lifetime fixes, redundant constant-write filtering,
+asynchronous translation-layer recording, grouped per-draw recording, root-CB0
+constant bindings, and resource allocation improvements.
+Added optional interfaces use the `D3D9On12` prefix; see
+[the interface header](include/D3D9On12Extensions.h).
+
 D3D9On12 is a mapping layer, which maps graphics commands from D3D9 to D3D12. D3D9On12 is **not** an implementation of the D3D9 **API**, but is instead an implementation of the D3D9 usermode **DDI** (device driver interface). That means it is not a binary named d3d9.dll, but is named d3d9on12.dll.
 
 When an application creates a D3D9 device, they may choose for it to be a D3D9On12 device, rather than a native D3D9 device (see [Direct3DCreate9On12](https://github.com/microsoft/DirectX-Specs/blob/master/d3d/TranslationLayerResourceInterop.md#function-direct3dcreate9on12) and [Direct3DCreate9On12Ex](https://github.com/microsoft/DirectX-Specs/blob/master/d3d/TranslationLayerResourceInterop.md#function-direct3dcreate9on12ex)). When this happens, d3d9on12.dll is loaded by the D3D9 runtime and initialized. When the application calls rendering commands, D3D9 will validate those commands, and then will convert those commands to the D3D9 DDI and send it to D3D9On12, just like any D3D9 driver. D3D9On12 will take these commands and convert them into D3D12 API calls, which are further validated by the D3D12 runtime, optionally including the D3D12 debug layer, which are then converted to the D3D12 DDI and sent to the D3D12 driver.
@@ -20,37 +38,19 @@ The device object internally uses an instance of the D3D12TranslationLayer immed
 
 ## Building
 
-In order to build D3D9On12, the [WDK](https://docs.microsoft.com/en-us/windows-hardware/drivers/download-the-wdk) (Windows Driver Kit) must be installed, in order to provide `d3d10umddi.h` to D3D9On12, and in order to generate the D3D12TranslationLayer_WDK project, which hosts some code required to parse DXBC shaders and containers. The D3D12TranslationLayer and its subprojects, D3D12TranslationLayer_WDK and DXBCParser, will be fetched from GitHub when building with CMake if D3D12TranslationLayer_WDK isn't already included, such as by a parent CMakeLists.txt that has already entered that project. The `DxbcSigner.dll` will be pulled in automatically from NuGet.
+Use CMake with Visual Studio and the Windows SDK/WDK. Dependencies are pinned and
+verified before compilation. A clean build downloads D3D12TranslationLayer and
+DirectX-Headers; restore the shader signer with NuGet before building.
 
-If you had a local copy of the D3D12TranslationLayer project, your top level project would look something like this:
-
-```CMake
-cmake_minimum_required(VERSION 3.14)
-include(FetchContent)
-
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-project(parent)
-
-FetchContent_Declare(
-    d3d12translationlayer
-    SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/D3D12TranslationLayer
-)
-FetchContent_MakeAvailable(d3d12translationlayer)
-
-add_subdirectory(D3D9On12)
+```powershell
+cmake -S . -B build -A Win32 -DUSE_PIX=OFF -DD3D9ON12_BUILD_TESTS=ON
+nuget install Microsoft.Direct3D.DxbcSigner -Version 1.0.0 -OutputDirectory build/packages
+cmake --build build --config Release --parallel
+./tests/run_probes.ps1 -Build build
+./scripts/Package-Release.ps1 -Build build -Output packages
 ```
 
-At the time of publishing, the D3D9On12 and D3D12TranslationLayer require **insider** versions of the SDK and WDK. Those can be found [here](https://www.microsoft.com/en-us/software-download/windowsinsiderpreviewWDK).
-
-D3D9On12 requires C++17, and only supports building with MSVC at the moment.
-
-### Troubleshoot building
-A somewhat common issue when trying to build the mapping layers is that there are multiple Windows SDKs installed, but only a subset of them has a corresponding WDK also installed. You can specify which version of the SDK to use when generating the solution by adding the following to your cmake command: `-DCMAKE_SYSTEM_VERSION=<SDK_VERSION>`.
-
-### Usage
-Note that in order to use your custom version of D3D9on12 you will also need to copy `WinPixEventRuntime.dll` (will automatically be placed in D3D9on12's build output) and `dxbcsigner.dll` along with it.
+Use `-A x64` in a separate build directory for 64-bit applications.
 
 ## Why open source?
 

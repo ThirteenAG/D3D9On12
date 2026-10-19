@@ -190,6 +190,10 @@ namespace D3D9on12
         D3D9on12_DDI_ENTRYPOINT_END_AND_RETURN_HR(hr);
     }
 
+    static volatile LONG g_processExiting = 0;
+    void Device::NoteProcessExit() noexcept { InterlockedExchange(&g_processExiting, 1); }
+    bool Device::IsProcessExiting() noexcept { return InterlockedCompareExchange(&g_processExiting, 0, 0) != 0; }
+
     _Check_return_ HRESULT APIENTRY DestroyDevice(_In_ HANDLE hDevice)
     {
         D3D9on12_DDI_ENTRYPOINT_START(TRUE);
@@ -199,14 +203,21 @@ namespace D3D9on12
             RETURN_E_INVALIDARG_AND_CHECK();
         }
 
-        HRESULT hr = pDevice->Destroy();
-        CHECK_HR(hr);
-
-        SAFE_DELETE(pDevice);
+        HRESULT hr = S_OK;
+        if (Device::IsProcessExiting())
+        {
+            // The worker is gone: the batched context's destructor would wait for it for ever. Leak the device; the OS reclaims it.
+            Device::UnregisterDevice(pDevice);
+        }
+        else
+        {
+            hr = pDevice->Destroy();
+            CHECK_HR(hr);
+            SAFE_DELETE(pDevice);
+        }
 
         D3D9on12_DDI_ENTRYPOINT_END_AND_RETURN_HR(hr);
     }
-
 
     void APIENTRY AcquireResource(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SYNCTOKEN* pToken)
     {
@@ -270,12 +281,17 @@ namespace D3D9on12
 
         if (SUCCEEDED(hr))
         {
+            pResource->NoteGpuUse();
             auto* pTranslationLayerResource = pResource->GetUnderlyingResource();
 
             if (   pTranslationLayerResource != nullptr
                 && pTranslationLayerResource->GetUnderlyingResource() != nullptr)
             {
                 hr = pTranslationLayerResource->GetUnderlyingResource()->QueryInterface(riid, ppv);
+                if (SUCCEEDED(hr) && pResource->GetParent())
+                {
+                    pResource->GetParent()->RegisterInteropResource(pResource);
+                }
             }
             else
             {
@@ -333,7 +349,6 @@ namespace D3D9on12
             }
         }
 
-        
         D3D9on12_DDI_ENTRYPOINT_END_AND_RETURN_HR(S_OK);
     }
 
@@ -379,7 +394,6 @@ namespace D3D9on12
         Device* pDevice = Device::GetDeviceFromHandle(hDevice);
         Resource* pResource = Resource::GetResourceFromHandle(hTexture);
 
-
         if (stage == DMAP_SAMPLER || stage == D3DDMAPSAMPLER)
         {
             if (pResource)
@@ -388,7 +402,6 @@ namespace D3D9on12
             }
             return S_OK;
         }
-
 
         if (pDevice == nullptr)
         {
@@ -404,7 +417,7 @@ namespace D3D9on12
     {
         D3D9on12_DDI_ENTRYPOINT_START(TRUE);
         Device* pDevice = Device::GetDeviceFromHandle(hDevice);
-        pDevice->GetContext().m_MaxFrameLatencyHelper.SetMaximumFrameLatency(MaxFrameLatency);
+        pDevice->GetFrameLatencyHelper().SetMaximumFrameLatency(MaxFrameLatency);
         D3D9on12_DDI_ENTRYPOINT_END_AND_REPORT_HR(hDevice, S_OK);
     }
 
@@ -413,7 +426,7 @@ namespace D3D9on12
         BOOL result = FALSE;
         D3D9on12_DDI_ENTRYPOINT_START(TRUE);
         Device* pDevice = Device::GetDeviceFromHandle(hDevice);
-        result = pDevice->GetContext().m_MaxFrameLatencyHelper.IsMaximumFrameLatencyReached();
+        result = pDevice->IsPresentLatencyReached();
         D3D9on12_DDI_ENTRYPOINT_END_AND_REPORT_HR(hDevice, S_OK);
         return result;
     }
@@ -449,12 +462,37 @@ namespace D3D9on12
         return S_OK;
     }
 
+#if defined(D3D9ON12_BATCHED_RENDERING)
+    static UINT CountPhysicalProcessorCores()
+    {
+        DWORD bytes = 0;
+        GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &bytes);
+        if (!bytes || GetLastError() != ERROR_INSUFFICIENT_BUFFER) return 0;
+        std::vector<BYTE> buffer(bytes);
+        if (!GetLogicalProcessorInformationEx(RelationProcessorCore,
+                reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()), &bytes)) return 0;
+        if (bytes > buffer.size()) return 0;
+        UINT cores = 0;
+        for (DWORD offset = 0; offset < bytes;)
+        {
+            constexpr DWORD headerBytes = offsetof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Processor);
+            if (bytes - offset < headerBytes) return 0;
+            auto* entry = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data() + offset);
+            if (entry->Size < headerBytes || entry->Size > bytes - offset) return 0;
+            if (entry->Relationship == RelationProcessorCore) ++cores;
+            offset += entry->Size;
+        }
+        return cores;
+    }
+#endif
+
     HRESULT Device::Init(ID3D12Device *pDevice, ID3D12CommandQueue *pCommandQueue)
     {
         HRESULT hr = S_OK;
         
         m_pDevice = pDevice;
         m_pCommandQueue = pCommandQueue;
+        RegisterDevice(this);
 
         D3D12_FEATURE_DATA_D3D12_OPTIONS FeatureDataD3D12 = {};
         D3D12TranslationLayer::TranslationLayerCallbacks Callbacks{};
@@ -469,7 +507,19 @@ namespace D3D9on12
         {
             D3D12TranslationLayer::ImmediateContext::CreationArgs args = {};
             args.RequiresBufferOutOfBoundsHandling = false;
+#if defined(D3D12TL_ROOT_CB0_SUPPORTED)
+            char rootCB0[2] = {};
+            // The verified root-CB0 layout avoids rebuilding a descriptor table
+            // for the most frequently updated constant bank. Keep an opt-out for
+            // compatibility diagnostics; unsupported TL builds retain their layout.
+            args.UseRootCB0 = !(GetEnvironmentVariableA("D3D9ON12_ROOT_CB0", rootCB0, ARRAYSIZE(rootCB0)) == 1 && rootCB0[0] == '0');
+#endif
+#if defined(D3D9ON12_BATCHED_RENDERING)
+            // The worker and the DDI caller touch TL allocators/rename containers concurrently.
+            args.CreatesAndDestroysAreMultithreaded = true;
+#else
             args.CreatesAndDestroysAreMultithreaded = !RegistryConstants::g_cSingleThread;
+#endif
             args.RenamingIsMultithreaded = args.CreatesAndDestroysAreMultithreaded;
             args.UseThreadpoolForPSOCreates = false;
             args.UseRoundTripPSOs = false;
@@ -486,7 +536,7 @@ namespace D3D9on12
             args.MaxSRVHeapSize = min(RegistryConstants::g_cMaxSRVHeapSize, g_AppCompatInfo.MaxSRVHeapSize);
             args.BufferPoolTrimThreshold = min(RegistryConstants::g_cBufferPoolTrimThreshold, g_AppCompatInfo.BufferPoolTrimThreshold);
 
-            if (!RegistryConstants::g_cSingleThread)
+            if (args.CreatesAndDestroysAreMultithreaded)
             {
                 m_lockedResourceRanges.InitLock();
             }
@@ -506,6 +556,41 @@ namespace D3D9on12
             m_pImmediateContext->SetNumScissorRects(1);
             m_pImmediateContext->SetNumViewports(1);
 
+            if (PlacedResourcePool::IsEnabled())
+            {
+                m_pPlacedResourcePool = std::make_unique<PlacedResourcePool>(GetDevice());
+            }
+
+#if defined(D3D9ON12_BATCHED_RENDERING)
+            // Private translation-layer worker. Only when the runtime permits driver
+            // threading and more than one physical core exists; otherwise the facade
+            // records straight into the ImmediateContext.
+            D3D12TranslationLayer::BatchedContext::CreationArgs batchArgs{};
+            batchArgs.CreatesAndDestroysAreMultithreaded = true;
+            batchArgs.SubmitBatchesToWorkerThread = true;
+            D3D12TranslationLayer::BatchedContext::Callbacks batchCallbacks{};
+            batchCallbacks.ThreadErrorCallback = [this](HRESULT error)
+            {
+                // Record only the first failure; ordinary DDIs rethrow it on their caller.
+                HRESULT expected = S_OK;
+                m_batchError.compare_exchange_strong(expected, error);
+            };
+            batchCallbacks.PostSubmitCallback = []() {};
+            char privateWorker[2] = {};
+            const bool disablePrivateWorker = GetEnvironmentVariableA("D3D9ON12_PRIVATE_WORKER", privateWorker, ARRAYSIZE(privateWorker)) == 1 && privateWorker[0] == '0';
+            const bool allowPrivateWorker = m_runtimeCreateFlags.AllowMultithreading && m_physicalCoreCount > 1 && !disablePrivateWorker;
+            if (allowPrivateWorker)
+            {
+                m_pBatchedContext.emplace(*m_pImmediateContext, batchArgs, batchCallbacks);
+            }
+#if defined(D3D12TL_RECORDING_GROUP_SUPPORTED)
+            char recordingGroup[2] = {};
+            const bool groups = !(GetEnvironmentVariableA("D3D9ON12_RECORDING_GROUP", recordingGroup, ARRAYSIZE(recordingGroup)) == 1 && recordingGroup[0] == '0');
+            m_renderContext.Reset(&*m_pImmediateContext, m_pBatchedContext ? &*m_pBatchedContext : nullptr, groups);
+#else
+            m_renderContext.Reset(&*m_pImmediateContext, m_pBatchedContext ? &*m_pBatchedContext : nullptr);
+#endif
+#endif
             hr = m_constantsManager.Init();
             CHECK_HR(hr);
         }
@@ -539,6 +624,10 @@ namespace D3D9on12
     {
         memcpy( (void*)&m_Callbacks, CreateDeviceArgs.pCallbacks, sizeof( m_Callbacks ) );
         memset( m_streamFrequency, 0, sizeof( m_streamFrequency ) );
+#if defined(D3D9ON12_BATCHED_RENDERING)
+        m_runtimeCreateFlags = CreateDeviceArgs.Flags;
+        m_physicalCoreCount = CountPhysicalProcessorCores();
+#endif
 
         HRESULT hr = Init( m_Adapter.GetDevice(), m_Adapter.GetCommandQueue() );
 
@@ -562,6 +651,15 @@ namespace D3D9on12
 
     Device::~Device()
     {
+        UnregisterDevice(this);
+#if defined(D3D9ON12_BATCHED_RENDERING)
+        if (m_pBatchedContext)
+        {
+            try { m_pBatchedContext->ProcessBatch(); } catch (...) {}
+            m_renderContext.Reset(&*m_pImmediateContext, nullptr);
+            m_pBatchedContext.reset();
+        }
+#endif
         if (m_pVideoDevice)
         {
             m_pVideoDevice->~VideoDevice();
@@ -570,6 +668,13 @@ namespace D3D9on12
 
     HRESULT Device::Destroy()
     {
+        UnregisterDevice(this);
+#if defined(D3D9ON12_BATCHED_RENDERING)
+        // Retire every queued packet before dependent children and the ImmediateContext go away.
+        GetContextForDestruction();
+        m_renderContext.Reset(&*m_pImmediateContext, nullptr);
+        m_pBatchedContext.reset();
+#endif
         m_constantsManager.Destroy();
         m_systemMemoryAllocator.Destroy();
         m_Adapter.DeviceDestroyed(this);
@@ -580,14 +685,14 @@ namespace D3D9on12
     HRESULT Device::ResolveDeferredState(OffsetArg BaseVertexStart, OffsetArg BaseIndexStart)
     {
         //First resolve the pipeline state
-        HRESULT hr = m_pipelineState.ResolveDeferredState(*this, BaseVertexStart, BaseIndexStart);
+        HRESULT hr = GetPipelineState().ResolveDeferredState(*this, BaseVertexStart, BaseIndexStart);
 
         return hr;
     }
 
     WeakHash Device::HashStreamFrequencyData(WeakHash inputHash)
     {
-        return HashData(m_streamFrequency, sizeof(m_streamFrequency), inputHash);
+        return HashData(GetPointerToStreamFrequencies(), sizeof(m_streamFrequency), inputHash);
     }
 
     void Device::EnsureVideoDevice()

@@ -1,0 +1,9 @@
+{
+  "project": "D3D9On12",
+  "revision": "@D3D9ON12_BUILD_REVISION@",
+  "architecture": "@D3D9ON12_BUILD_ARCHITECTURE@",
+  "compiler": "@CMAKE_CXX_COMPILER_ID@ @CMAKE_CXX_COMPILER_VERSION@",
+  "translationLayerRevision": "bc726e2af71b0060b879661df62172a9379d1f43",
+  "translationLayerPatchSignature": "@D3D9ON12_TL_PATCH_SIGNATURE@",
+  "releaseConfiguration": true
+}

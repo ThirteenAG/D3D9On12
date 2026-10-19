@@ -297,6 +297,7 @@ namespace D3D9on12
     {
         D3D12TranslationLayer::ImmediateContext& context = device.GetContext();
         Resource& source = args.m_source;
+        source.NoteGpuUse();
         Resource& destination = args.m_destination;
 
         COPY_TO_SYSTEM_MEMORY_WARNING();
@@ -362,6 +363,7 @@ namespace D3D9on12
 
     void Resource::CopyResource(Device& device, ResourceCopyArgs& args)
     {
+        args.m_destination.MarkGpuWritten();
         // DX9 allows for uploading from a src resource with different mip levels than the dst resource.
         // In this case, only the matching mip levels from the src are copied over
         if (args.m_allSubresources && args.m_source.m_numSubresources != args.m_destination.m_numSubresources)
@@ -370,7 +372,7 @@ namespace D3D9on12
         }
         else
         {
-            D3D12TranslationLayer::ImmediateContext& context = device.GetContext();
+            auto& context = device.GetResourceCommandContext();
             Resource& source = args.m_source;
             Resource& destination = args.m_destination;
 
@@ -454,8 +456,10 @@ namespace D3D9on12
 
     void Resource::CopySubResource(Device& device, ResourceCopyArgs& args)
     {
-        D3D12TranslationLayer::ImmediateContext& context = device.GetContext();
+        args.m_destination.MarkGpuWritten();
+        auto& context = device.GetResourceCommandContext();
         Resource& source = args.m_source;
+        source.NoteGpuUse();
         Resource& destination = args.m_destination;
 
 
@@ -576,11 +580,32 @@ namespace D3D9on12
                     Flags |= D3D12TranslationLayer::ImmediateContext::UpdateSubresourcesFlags::ChannelSwapR10G10B10A2;
                 }
 
-                context.UpdateSubresources(destination.GetUnderlyingResource(),
+                // Preparing an upload touches immediate allocation state and consumes
+                // application memory now; this branch is never deferred.
+                bool uploadedThroughBatch = false;
+#if defined(D3D9ON12_BATCHED_RENDERING)
+                if (device.GetBatchedContext() && Flags == D3D12TranslationLayer::ImmediateContext::UpdateSubresourcesFlags::ScenarioImmediateContext)
+                {
+                    // Streaming uploads (runtime-managed textures) arrive in bursts; record them into the batch instead
+                    // of draining the worker for each one.
+                    device.GetRenderContext().ResourceUpdateSubresourceUP(destination.GetUnderlyingResource(), destinationSubresourceIndex,
+                        (args.m_dimensionsCoverEntireResource) ? nullptr : &destBox, pSrcData, SubresourceDesc.SysMemPitch, SubresourceDesc.SysMemSlicePitch);
+                    uploadedThroughBatch = true;
+                }
+#endif
+                if (!uploadedThroughBatch)
+                {
+#if defined(D3D9ON12_BATCHED_CLEAR_COPY)
+                auto& uploadContext = device.GetContext();
+#else
+                auto& uploadContext = context;
+#endif
+                uploadContext.UpdateSubresources(destination.GetUnderlyingResource(),
                     D3D12TranslationLayer::CSubresourceSubset(1, 1, destination.GetUnderlyingResource()->SubresourceMultiplier(), MipLevel, ArraySlice, PlaneSlice),
                     &SubresourceDesc,
                     (args.m_dimensionsCoverEntireResource) ? nullptr : &destBox,
                     Flags);
+                }
             }
             else
             {
@@ -743,6 +768,7 @@ namespace D3D9on12
     // which exist in one texture).
     void Resource::CopyMatchingMipLevels(Device& device, ResourceCopyArgs& args)
     {
+        args.m_destination.MarkGpuWritten();
         Resource& destination = args.m_destination;
         Resource& source = args.m_source;
 

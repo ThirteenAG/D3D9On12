@@ -1,0 +1,13 @@
+build/
+build-*/
+out/
+.vs/
+*.user
+
+# Python benchmark caches
+__pycache__/
+*.py[cod]
+
+# Local NuGet restores and release packages
+packages/
+pkg/

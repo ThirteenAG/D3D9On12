@@ -1,0 +1,64 @@
+--- a/include/ImmediateContext.hpp
++++ b/include/ImmediateContext.hpp
+@@ -1,6 +1,7 @@
+ // Copyright (c) Microsoft Corporation.
+ // Licensed under the MIT License.
+ #pragma once
++#include <optional>
+ 
+ namespace D3D12TranslationLayer
+ {
+@@ -32,6 +33,18 @@
+             // Just drop the error
+             // All uses of this pool use unique_comptr, which will release the resource
+         }
++    }
++
++    // The caller can defer allocation until its outer container lock is released.
++    std::optional<TResourceType> TryRetrieveFromPool(UINT64 CurrentFenceValue)
++    {
++        auto lock = m_pLock ? std::unique_lock(*m_pLock) : std::unique_lock<std::mutex>();
++        auto Head = m_Pool.begin();
++        if (Head == m_Pool.end() || CurrentFenceValue < Head->first) return std::nullopt;
++        assert(Head->second);
++        TResourceType result = std::move(Head->second);
++        m_Pool.erase(Head);
++        return std::move(result);
+     }
+ 
+     template <typename PFNCreateNew, typename... CreationArgType>
+@@ -192,24 +205,18 @@
+         UINT PoolIndex = IndexFromSize(Size);
+         UINT AlignedSize = (PoolIndex + 1) * ResourceSizeMultiple;
+ 
+-        auto Lock = m_Lock.TakeLock();
+-
+-        if (PoolIndex >= m_MultiPool.size())
+-        {
+-            // pfnCreateNew might be expensive, and won't touch the data structure
+-            if (Lock.owns_lock())
++        {
++            auto Lock = m_Lock.TakeLock();
++            if (PoolIndex < m_MultiPool.size())
+             {
+-                Lock.unlock();
++                auto resource = m_MultiPool[PoolIndex].TryRetrieveFromPool(CurrentFenceValue);
++                if (resource) return std::move(*resource);
+             }
+-            return std::move(pfnCreateNew(AlignedSize)); // throw( _com_error )
+-        }
+-        ASSUME(PoolIndex < m_MultiPool.size());
+-
+-        // Note that RetrieveFromPool can call pfnCreateNew
+-        // m_Lock will be held during this potentially slow operation
+-        // This is not optimized because it is expected that once an app reaches steady-state
+-        // behavior, the pool will not need to grow.
+-        return std::move(m_MultiPool[PoolIndex].RetrieveFromPool(CurrentFenceValue, pfnCreateNew, AlignedSize)); // throw( _com_error )
++        }
++        // Creation does not touch the pool. Keep misses, including empty or
++        // fence-blocked existing buckets, outside the shared container lock.
++        // Do not retain a reference into the vector while it can be resized.
++        return std::move(pfnCreateNew(AlignedSize)); // throw( _com_error )
+     }
+ 
+     void Trim(UINT64 CurrentFenceValue)

@@ -207,33 +207,25 @@ namespace D3D9on12
         class BindingTracker
         {
         public:
-            void Bind(UINT bindIndex) { m_boundIndices.push_back(bindIndex); }
-            void Unbind(UINT bindIndex)
+            void Bind(UINT bindIndex) { Check9on12(bindIndex < 32); m_boundMask |= BIT(bindIndex); }
+            void Unbind(UINT bindIndex) { Check9on12(bindIndex < 32); m_boundMask &= ~BIT(bindIndex); }
+            bool IsBound() const { return m_boundMask != 0; }
+            UINT GetBindingMask() const { return m_boundMask; }
+            UINT FirstBoundIndex() const
             {
-                // Doing an inefficient O(N) delete, betting that this is generally okay
-                // because a resource should generally only be bound at a couple of places
-                // at any given time.
-                if (m_boundIndices.size() > 5)
-                {
-                    INEFFICIENT_UNBINDING_ARRAY_DELETION();
-                }
-
-                for (size_t i = 0; i < m_boundIndices.size(); i++)
-                {
-                    if (bindIndex == m_boundIndices[i])
-                    {
-                        m_boundIndices.erase(m_boundIndices.begin() + i);
-                        return;
-                    }
-                }
+                Check9on12(IsBound());
+                ULONG index = 0;
+                BitScanForward(&index, m_boundMask);
+                return index;
             }
-
-            bool IsBound() { return m_boundIndices.size() > 0; }
-            const std::vector<UINT> &GetBindingIndices() { return m_boundIndices; }
         private:
-            std::vector<UINT> m_boundIndices;
+            // D3D9's SRV/RTV/DSV/VB/IB binding slots all fit in one word.
+            // A slot names one resource, so bind membership needs no list or allocation.
+            UINT m_boundMask = 0;
         };
 
+        // Reverse maps also let asynchronous destruction inspect this resource
+        // without scanning another thread's mutable IA bindings.
         BindingTracker m_SRVBindingTracker;
         BindingTracker m_RTVBindingTracker;
         BindingTracker m_DSVBindingTracker;
@@ -334,7 +326,7 @@ namespace D3D9on12
         ShaderConv::TEXTURETYPE m_srvTextureType;
 
         bool m_isDecodeCompressedBuffer;
-        bool m_isD3D9SystemMemoryPool; //System memory resources need to be updated at bind time
+        bool m_isD3D9SystemMemoryPool = false; // System-memory resources upload at bind time.
         
 
         struct LockData
@@ -344,9 +336,31 @@ namespace D3D9on12
             D3DDDI_LOCKFLAGS m_Flags;
             D3D12_BOX m_Box;
             UINT m_LockCount;
+            bool m_UsedCpuShadow = false;
         };
 
         std::vector<LockData> m_lockData;
+
+        // CPU-side copy of a lockable texture's contents (per subresource, D3D12 placement pitch). Locks of textures
+        // the GPU never wrote are served from it without any GPU work or wait, and the Unlock uploads the box through
+        // the batched context (D3D9 on D3D12 otherwise turns every texture Lock into a readback copy plus a GPU wait,
+        // because a lockable texture is CPU-readable). Dropped as soon as the GPU writes the texture.
+        std::vector<std::vector<BYTE>> m_cpuShadow;
+        bool m_gpuWritten = false;
+        void UnbindPipelineReferences(PipelineState& pipeline);
+        bool UsesCpuShadowForLocks() const;
+        BYTE* CpuShadowPointer(UINT subresourceIndex, const D3D12_BOX* pBox, UINT& pitch, UINT& slicePitch);
+    public:
+        // Any GPU write (render target, depth, clear, copy destination, interop import) invalidates the CPU shadow.
+        void NoteGpuUse() noexcept { m_initialUploadMapAllowed = false; }
+        void MarkGpuWritten() {
+            NoteGpuUse();
+            m_gpuWritten = true; if (!m_cpuShadow.empty()) { m_cpuShadow.clear(); m_cpuShadow.shrink_to_fit(); }
+        }
+    private:
+
+        bool m_initialUploadMapAllowed = false;
+        void* m_directUploadMap = nullptr;
 
         // Information which describes how the app 
         // represents the resource in system memory

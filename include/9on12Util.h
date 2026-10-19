@@ -2,7 +2,6 @@
 // Licensed under the MIT license.
 #pragma once
 #include <intrin.h>
-
 #if _M_AMD64
 #define SSE4_CRC_INPUT_TYPE UINT64
 #define SSE4_CRC_FUNCTION _mm_crc32_u64
@@ -23,6 +22,15 @@ namespace D3D9on12
     {
         void operator()(D3D12TranslationLayer::Resource*);
     };
+#if defined(D3D9ON12_BATCHED_RENDERING)
+    class Device;
+    // Temporary input buffers can die right after a queued draw: drain first.
+    struct CleanupBatchedInputResourceAndRelease
+    {
+        Device* m_device;
+        void operator()(D3D12TranslationLayer::Resource*);
+    };
+#endif
     typedef D3D12TranslationLayer::unique_comptr<D3D12TranslationLayer::Resource,
         CleanupResourceBindingsAndRelease> unique_unbind_resourceptr;
 
@@ -105,6 +113,16 @@ namespace D3D9on12
         case DXGI_ERROR_INVALID_CALL:           return D3DERR_DRIVERINTERNALERROR; // This is a driver error from the app's perspective as it means that 9on12 made an invalid call
         default:                                return hr;
         }
+    }
+
+    HRESULT TraceCpuOnlySetter(const char* name) noexcept;
+
+// Only for setters whose ordinary path cannot allocate, record GPU work, throw,
+// or return a DXGI status. The optional allocating spew keeps its own handler.
+#define D3D9ON12_CPU_SETTER_ENTRYPOINT() \
+    if (RegistryConstants::g_cEnableDDISpew) { \
+        const HRESULT traceResult = TraceCpuOnlySetter(__FUNCTION__); \
+        if (FAILED(traceResult)) return traceResult; \
     }
 
 #define D3D9on12_DDI_ENTRYPOINT_START(implemented) \

@@ -4,9 +4,23 @@
 
 namespace D3D9on12
 {
+    __declspec(noinline) HRESULT TraceCpuOnlySetter(const char* name) noexcept
+    {
+        // Keep allocating diagnostic strings and their exception frame off the
+        // ordinary CPU setter path, while preserving opt-in DDI spew.
+        try
+        {
+            PrintDebugMessage(std::string("Command ID: ") + std::to_string(InterlockedIncrement(&g_CommandID)));
+            PrintDebugMessage(WarningStrings::g_cDDIEntryHeader + std::string(name));
+            return S_OK;
+        }
+        catch (std::bad_alloc&) { return E_OUTOFMEMORY; }
+        catch (_com_error& error) { return TranslateDxgiHrToD3D9(error.Error()); }
+    }
+
     _Check_return_ HRESULT APIENTRY SetVertexShaderConstF(_In_ HANDLE hDevice, _In_ const D3DDDIARG_SETVERTEXSHADERCONST* pRegisters, _In_ const VOID* pData)
     {
-        D3D9on12_DDI_ENTRYPOINT_START(TRUE);
+        D3D9ON12_CPU_SETTER_ENTRYPOINT();
 
         Device* pDevice = Device::GetDeviceFromHandle(hDevice);
         if (pDevice == nullptr || pRegisters == nullptr || (pRegisters->Count > 0 && pData == nullptr))
@@ -16,12 +30,12 @@ namespace D3D9on12
 
         pDevice->GetConstantsManager().GetVertexShaderConstants().GetConstantBufferData(ShaderConv::CB_FLOAT).SetData(pData, pRegisters->Register, pRegisters->Count);
 
-        D3D9on12_DDI_ENTRYPOINT_END_AND_RETURN_HR(S_OK);
+        return S_OK;
     }
 
     _Check_return_ HRESULT APIENTRY SetVertexShaderConstI(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETVERTEXSHADERCONSTI* pRegisters, _In_ CONST INT* pData)
     {
-        D3D9on12_DDI_ENTRYPOINT_START(TRUE);
+        D3D9ON12_CPU_SETTER_ENTRYPOINT();
         Device* pDevice = Device::GetDeviceFromHandle(hDevice);
         if (pDevice == nullptr || pRegisters == nullptr || (pRegisters->Count > 0 && pData == nullptr))
         {
@@ -30,12 +44,12 @@ namespace D3D9on12
 
         pDevice->GetConstantsManager().GetVertexShaderConstants().GetConstantBufferData(ShaderConv::CB_INT).SetData(pData, pRegisters->Register, pRegisters->Count);
 
-        D3D9on12_DDI_ENTRYPOINT_END_AND_RETURN_HR(S_OK);
+        return S_OK;
     }
 
     _Check_return_ HRESULT APIENTRY SetVertexShaderConstB(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETVERTEXSHADERCONSTB* pRegisters, _In_ CONST BOOL* pData)
     {
-        D3D9on12_DDI_ENTRYPOINT_START(TRUE);
+        D3D9ON12_CPU_SETTER_ENTRYPOINT();
         Device* pDevice = Device::GetDeviceFromHandle(hDevice);
         if (pDevice == nullptr || pRegisters == nullptr || (pRegisters->Count > 0 && pData == nullptr))
         {
@@ -43,12 +57,12 @@ namespace D3D9on12
         }
 
         pDevice->GetConstantsManager().GetVertexShaderConstants().GetConstantBufferData(ShaderConv::CB_BOOL).SetData(pData, pRegisters->Register, pRegisters->Count);
-        D3D9on12_DDI_ENTRYPOINT_END_AND_RETURN_HR(S_OK);
+        return S_OK;
     }
 
     _Check_return_ HRESULT APIENTRY SetPixelShaderConstF(_In_ HANDLE hDevice, _In_ const D3DDDIARG_SETPIXELSHADERCONST* pRegisters, _In_ const FLOAT* pData)
     {
-        D3D9on12_DDI_ENTRYPOINT_START(TRUE);
+        D3D9ON12_CPU_SETTER_ENTRYPOINT();
 
         Device* pDevice = Device::GetDeviceFromHandle(hDevice);
         if (pDevice == nullptr || pRegisters == nullptr || (pRegisters->Count > 0 && pData == nullptr))
@@ -58,12 +72,12 @@ namespace D3D9on12
 
         pDevice->GetConstantsManager().GetPixelShaderConstants().GetConstantBufferData(ShaderConv::CB_FLOAT).SetData(pData, pRegisters->Register, pRegisters->Count);
 
-        D3D9on12_DDI_ENTRYPOINT_END_AND_RETURN_HR(S_OK);
+        return S_OK;
     }
 
     _Check_return_ HRESULT APIENTRY SetPixelShaderConstI(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETPIXELSHADERCONSTI* pRegisters, _In_ CONST INT* pData)
     {
-        D3D9on12_DDI_ENTRYPOINT_START(TRUE);
+        D3D9ON12_CPU_SETTER_ENTRYPOINT();
         Device* pDevice = Device::GetDeviceFromHandle(hDevice);
         if (pDevice == nullptr || pRegisters == nullptr || (pRegisters->Count > 0 && pData == nullptr))
         {
@@ -72,12 +86,12 @@ namespace D3D9on12
 
         pDevice->GetConstantsManager().GetPixelShaderConstants().GetConstantBufferData(ShaderConv::CB_INT).SetData(pData, pRegisters->Register, pRegisters->Count);
 
-        D3D9on12_DDI_ENTRYPOINT_END_AND_RETURN_HR(S_OK);
+        return S_OK;
     }
 
     _Check_return_ HRESULT APIENTRY SetPixelShaderConstB(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETPIXELSHADERCONSTB* pRegisters, _In_ CONST BOOL* pData)
     {
-        D3D9on12_DDI_ENTRYPOINT_START(TRUE);
+        D3D9ON12_CPU_SETTER_ENTRYPOINT();
         Device* pDevice = Device::GetDeviceFromHandle(hDevice);
         if (pDevice == nullptr || pRegisters == nullptr || (pRegisters->Count > 0 && pData == nullptr))
         {
@@ -85,7 +99,7 @@ namespace D3D9on12
         }
 
         pDevice->GetConstantsManager().GetPixelShaderConstants().GetConstantBufferData(ShaderConv::CB_BOOL).SetData(pData, pRegisters->Register, pRegisters->Count);
-        D3D9on12_DDI_ENTRYPOINT_END_AND_RETURN_HR(S_OK);
+        return S_OK;
     }
 
     HRESULT ConstantsManager::Init()
@@ -128,16 +142,36 @@ namespace D3D9on12
 
     void ConstantsManager::BindToPipeline(Device& device, ConstantBufferBinding& buffer, D3D12TranslationLayer::EShaderStage shaderStage)
     {
+        ConstantBufferBinding* buffers[] = { &buffer };
+        BindToPipeline(device, buffers, 1, 1, shaderStage);
+    }
+
+    void ConstantsManager::BindToPipeline(Device& device, ConstantBufferBinding* const* buffers, UINT count, UINT dirtyMask, D3D12TranslationLayer::EShaderStage shaderStage)
+    {
+        if (!dirtyMask) return;
+        UINT first = 0, end = count;
+        while (!(dirtyMask & BIT(first))) ++first;
+        while (!(dirtyMask & BIT(end - 1))) --end;
+        D3D12TranslationLayer::Resource* resources[3];
+        UINT offsets[3], sizes[3];
+        Check9on12(count <= ARRAYSIZE(resources));
+        for (UINT i = first; i < end; ++i)
+        {
+            resources[i] = buffers[i]->m_buffer.m_pResource;
+            offsets[i] = buffers[i]->m_buffer.m_offsetFromBase / (sizeof(FLOAT) * 4);
+            sizes[i] = g_cMaxConstantBufferSize / (sizeof(FLOAT) * 4);
+        }
+        const UINT startSlot = buffers[first]->m_shaderRegister;
         switch (shaderStage)
         {
         case D3D12TranslationLayer::e_VS:
-            device.SetConstantBuffer<D3D12TranslationLayer::e_VS>(buffer.m_shaderRegister, buffer.m_buffer.m_pResource, buffer.m_buffer.m_offsetFromBase);
+            device.GetRenderContext().SetConstantBuffers<D3D12TranslationLayer::e_VS>(startSlot, end - first, resources + first, offsets + first, sizes + first);
             break;
         case D3D12TranslationLayer::e_GS:
-            device.SetConstantBuffer<D3D12TranslationLayer::e_GS>(buffer.m_shaderRegister, buffer.m_buffer.m_pResource, buffer.m_buffer.m_offsetFromBase);
+            device.GetRenderContext().SetConstantBuffers<D3D12TranslationLayer::e_GS>(startSlot, end - first, resources + first, offsets + first, sizes + first);
             break;
         case D3D12TranslationLayer::e_PS:
-            device.SetConstantBuffer<D3D12TranslationLayer::e_PS>(buffer.m_shaderRegister, buffer.m_buffer.m_pResource, buffer.m_buffer.m_offsetFromBase);
+            device.GetRenderContext().SetConstantBuffers<D3D12TranslationLayer::e_PS>(startSlot, end - first, resources + first, offsets + first, sizes + first);
             break;
         default:
             assert(false);
@@ -170,27 +204,16 @@ namespace D3D9on12
         m_extension.Destroy();
     }
 
-    void ConstantsManager::StageConstants::UpdateAppVisibleAndBindToPipeline(Device& device, UINT maxFloats, UINT maxInts, UINT maxBools)
+    void ConstantsManager::StageConstants::UpdateAppVisibleAndBindToPipeline(Device& device, UINT maxFloats, UINT maxInts, UINT maxBools, bool force)
     {
         Check9on12(maxFloats % 4 == 0);
-        Result result = m_floats.UpdateData(device, maxFloats / 4);
-        if (maxFloats && result == Result::S_CHANGE)
-        {
-            BindToPipeline(device, m_floats.m_binding, m_shaderType);
-        }
-
         Check9on12(maxInts % 4 == 0);
-        result = m_integers.UpdateData(device, maxInts / 4);
-        if (maxInts && result == Result::S_CHANGE)
-        {
-            BindToPipeline(device, m_integers.m_binding, m_shaderType);
-        }
-
-        result = m_booleans.UpdateData(device, maxBools);
-        if (maxBools && result == Result::S_CHANGE)
-        {
-            BindToPipeline(device, m_booleans.m_binding, m_shaderType);
-        }
+        UINT dirty = force ? 7 : 0;
+        if (m_floats.UpdateData(device, maxFloats / 4) == Result::S_CHANGE) dirty |= BIT(0);
+        if (m_integers.UpdateData(device, maxInts / 4) == Result::S_CHANGE) dirty |= BIT(1);
+        if (m_booleans.UpdateData(device, maxBools) == Result::S_CHANGE) dirty |= BIT(2);
+        ConstantBufferBinding* bindings[] = { &m_floats.m_binding, &m_integers.m_binding, &m_booleans.m_binding };
+        BindToPipeline(device, bindings, ARRAYSIZE(bindings), dirty, m_shaderType);
     }
 
     void ConstantsManager::StageConstants::NullOutBindings(Device& /*device*/, ConstantBufferBinding& nullCB)
@@ -224,10 +247,9 @@ namespace D3D9on12
 
             if (m_pixelShaderData.m_dirty)
             {
-                BindToPipeline(m_device, m_pixelShaderData.m_extension1, D3D12TranslationLayer::EShaderStage::e_PS);
-                BindToPipeline(m_device, m_pixelShaderData.m_extension2, D3D12TranslationLayer::EShaderStage::e_PS);
-                BindToPipeline(m_device, m_pixelShaderData.m_extension3, D3D12TranslationLayer::EShaderStage::e_PS);
-                m_pixelShaderData.m_dirty = false;
+                ConstantBufferBinding* bindings[] = { &m_pixelShaderData.m_extension1, &m_pixelShaderData.m_extension2, &m_pixelShaderData.m_extension3 };
+                BindToPipeline(m_device, bindings, ARRAYSIZE(bindings), m_pixelShaderData.m_dirty, D3D12TranslationLayer::e_PS);
+                m_pixelShaderData.m_dirty = 0;
             }
         }
     }
@@ -266,7 +288,7 @@ namespace D3D9on12
         assert(dataSize <= UINT_MAX);
         pBinding->Version(pData, static_cast<UINT>(dataSize));
 
-        m_pixelShaderData.m_dirty = true;
+        m_pixelShaderData.m_dirty |= BIT(extension - ShaderConv::CB_PS_EXT);
 
         return Result::S_SUCCESS;
     }

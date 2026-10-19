@@ -52,6 +52,9 @@ namespace D3D9on12
             RETURN_E_INVALIDARG_AND_CHECK();
         }
 
+#if defined(D3D9ON12_BATCHED_RENDERING)
+        pDevice->GetContextForDestruction();
+#endif
         delete(pInputLayout);
 
         D3D9on12_DDI_ENTRYPOINT_END_AND_RETURN_HR(S_OK);
@@ -100,7 +103,7 @@ namespace D3D9on12
     InputLayout::~InputLayout()
     {
         auto &InputAssembly = m_device.GetPipelineState().GetInputAssembly();
-        if (&InputAssembly.GetInputLayout() == this)
+        if (InputAssembly.GetInputLayoutPointer() == this)
         {
             InputAssembly.SetVertexDeclaration(nullptr);
         }

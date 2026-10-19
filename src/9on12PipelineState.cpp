@@ -13,7 +13,13 @@ namespace D3D9on12
             RETURN_E_INVALIDARG_AND_CHECK();
         }
 
-        pDevice->GetPipelineState().SetRenderState(*pDevice, (DWORD)pRenderStateArg->State, (DWORD)pRenderStateArg->Value);
+        // Queued-interop marker (D3D9On12Extensions.h): the value is a token, not a render state.
+        const bool interopMarker = (DWORD)pRenderStateArg->State == D3D9ON12_INTEROP_MARKER_RENDERSTATE &&
+            pDevice->TryExecuteInteropMarker((UINT)pRenderStateArg->Value);
+        if (!interopMarker)
+        {
+            pDevice->GetPipelineState().SetRenderState(*pDevice, (DWORD)pRenderStateArg->State, (DWORD)pRenderStateArg->Value);
+        }
 
         D3D9on12_DDI_ENTRYPOINT_END_AND_RETURN_HR(S_OK);
     }
@@ -324,7 +330,7 @@ namespace D3D9on12
             break;
 
         case D3DTSS_ADDRESSU:
-            if (dwValue > D3DTADDRESS_MIRRORONCE)
+            if (dwValue < D3DTADDRESS_WRAP || dwValue > D3DTADDRESS_MIRRORONCE)
             {
                 // some apps pass bad data here that results in device removed. Assume the default value.
                 dwValue = D3DTADDRESS_WRAP;
@@ -334,7 +340,7 @@ namespace D3D9on12
             break;
 
         case D3DTSS_ADDRESSV:
-            if (dwValue > D3DTADDRESS_MIRRORONCE)
+            if (dwValue < D3DTADDRESS_WRAP || dwValue > D3DTADDRESS_MIRRORONCE)
             {
                 // some apps pass bad data here that results in device removed. Assume the default value.
                 dwValue = D3DTADDRESS_WRAP;
@@ -344,7 +350,7 @@ namespace D3D9on12
             break;
 
         case D3DTSS_ADDRESSW:
-            if (dwValue > D3DTADDRESS_MIRRORONCE)
+            if (dwValue < D3DTADDRESS_WRAP || dwValue > D3DTADDRESS_MIRRORONCE)
             {
                 // some apps pass bad data here that results in device removed. Assume the default value.
                 dwValue = D3DTADDRESS_WRAP;
@@ -354,7 +360,7 @@ namespace D3D9on12
             break;
 
         case D3DTSS_MAXANISOTROPY:
-            if (dwValue > cD3D9Caps.MaxAnisotropy)
+            if (dwValue < 1 || dwValue > cD3D9Caps.MaxAnisotropy)
             {
                 // some apps pass bad data here that results in device removed. Assume default value
                 dwValue = 1;
@@ -462,12 +468,20 @@ namespace D3D9on12
         HRESULT hr = S_OK;
         if (!m_bNeedsPipelineState) return S_OK;
 
-        hr = m_inputAssembly.ResolveDeferredState(device, m_PSODesc, BaseVertexStart, BaseIndexStart);
+#if defined(D3D9ON12_BATCHED_RENDERING) && defined(D3D12TL_RECORDING_GROUP_SUPPORTED)
+        auto recordingGroup = device.GetRenderContext().BeginRecordingGroup();
+#endif
+
+        {
+            hr = m_inputAssembly.ResolveDeferredState(device, m_PSODesc, BaseVertexStart, BaseIndexStart);
+        }
         CHECK_HR(hr);
 
         if (SUCCEEDED(hr))
         {
-            hr = m_vertexStage.ResolveDeferredState(device, m_PSODesc);
+            {
+                hr = m_vertexStage.ResolveDeferredState(device, m_PSODesc);
+            }
             CHECK_HR(hr);
         }
 
@@ -475,7 +489,9 @@ namespace D3D9on12
         UINT textureDirtyMaskToKeep = 0;
         if (SUCCEEDED(hr))
         {
-            hr = m_pixelStage.ResolveDeferredState(device, m_PSODesc, textureDirtyMaskToKeep);
+            {
+                hr = m_pixelStage.ResolveDeferredState(device, m_PSODesc, textureDirtyMaskToKeep);
+            }
             CHECK_HR(hr);
         }
 
@@ -488,7 +504,7 @@ namespace D3D9on12
 
             if (pPipelineState)
             {
-                device.GetContext().SetPipelineState(pPipelineState);
+                device.GetRenderContext().SetPipelineState(pPipelineState);
             }
         }
 
@@ -509,7 +525,9 @@ namespace D3D9on12
 
         m_dirtyFlags.Textures |= textureDirtyMaskToKeep;
 
-        device.GetConstantsManager().BindShaderConstants();
+        {
+            device.GetConstantsManager().BindShaderConstants();
+        }
         CHECK_HR(hr);
 
         return hr;

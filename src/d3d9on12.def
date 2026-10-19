@@ -3,3 +3,5 @@ EXPORTS
     GetPrivateDDITable
     GetPrivateDDITableVersioned
     SetAppCompatData
+    D3D9On12Capabilities
+    D3D9On12QueueInterop

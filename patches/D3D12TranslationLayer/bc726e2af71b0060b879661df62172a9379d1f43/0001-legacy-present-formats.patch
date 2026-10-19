@@ -1,0 +1,136 @@
+--- a/include/BlitHelper.hpp
++++ b/include/BlitHelper.hpp
+@@ -27,8 +27,16 @@
+     {
+     public:
+         BlitHelper(ImmediateContext *pContext);
+-        void Blit(Resource *pSrc, UINT *pSrcSubresourceIndices, UINT numSrcSubresources, const RECT& srcRect, Resource *pDst, UINT *pDstSubresourceIndices, UINT numDstSubresources, const RECT& dstRect, bool bEnableAlpha = false, bool bSwapRBChannels = false);
+-        void Blit(Resource* pSrc, UINT SrcSubresourceIdx, const RECT& srcRect, Resource* pDst, UINT DstSubresourceIdx, const RECT& dstRect, bool bEnableAlpha = false, bool bSwapRBChannels = false);
++        void Blit(Resource *pSrc, UINT *pSrcSubresourceIndices, UINT numSrcSubresources, const RECT& srcRect, Resource *pDst, UINT *pDstSubresourceIndices, UINT numDstSubresources, const RECT& dstRect, bool bEnableAlpha = false, bool bSwapRBChannels = false
++#ifdef D3D12TL_EXPERIMENTAL_LEGACY_PRESENT_FORMATS
++            , bool bForceOpaqueAlpha = false
++#endif
++        );
++        void Blit(Resource* pSrc, UINT SrcSubresourceIdx, const RECT& srcRect, Resource* pDst, UINT DstSubresourceIdx, const RECT& dstRect, bool bEnableAlpha = false, bool bSwapRBChannels = false
++#ifdef D3D12TL_EXPERIMENTAL_LEGACY_PRESENT_FORMATS
++            , bool bForceOpaqueAlpha = false
++#endif
++        );
+ 
+     protected:
+         using BlitPipelineState = DeviceChildImpl<ID3D12PipelineState>;
+--- a/src/BlitHelper.cpp
++++ b/src/BlitHelper.cpp
+@@ -138,7 +138,11 @@
+         return spPSO.get();
+     }
+ 
+-    void BlitHelper::Blit(Resource* pSrc, UINT SrcSubresourceIdx, const RECT& SrcRect, Resource* pDst, UINT DstSubresourceIdx, const RECT& DstRect, bool bEnableAlpha, bool bSwapRBChannels)
++    void BlitHelper::Blit(Resource* pSrc, UINT SrcSubresourceIdx, const RECT& SrcRect, Resource* pDst, UINT DstSubresourceIdx, const RECT& DstRect, bool bEnableAlpha, bool bSwapRBChannels
++#ifdef D3D12TL_EXPERIMENTAL_LEGACY_PRESENT_FORMATS
++        , bool bForceOpaqueAlpha
++#endif
++    )
+     {
+         UINT SrcPlaneCount = pSrc->AppDesc()->NonOpaquePlaneCount();
+         UINT DstPlaneCount = pDst->AppDesc()->NonOpaquePlaneCount();
+@@ -156,10 +160,18 @@
+         };
+         FillIndices(pSrc, SrcSubresourceIdx, SrcPlaneCount, SrcSubresourceIndices);
+         FillIndices(pDst, DstSubresourceIdx, DstPlaneCount, DstSubresourceIndices);
+-        Blit(pSrc, SrcSubresourceIndices, SrcPlaneCount, SrcRect, pDst, DstSubresourceIndices, DstPlaneCount, DstRect, bEnableAlpha, bSwapRBChannels);
+-    }
+-
+-    void BlitHelper::Blit(Resource *pSrc, UINT *pSrcSubresourceIndices, UINT numSrcSubresources, const RECT& srcRect, Resource *pDst, UINT *pDstSubresourceIndices, UINT numDstSubresources, const RECT& dstRect, bool bEnableAlpha, bool bSwapRBChannels)
++        Blit(pSrc, SrcSubresourceIndices, SrcPlaneCount, SrcRect, pDst, DstSubresourceIndices, DstPlaneCount, DstRect, bEnableAlpha, bSwapRBChannels
++#ifdef D3D12TL_EXPERIMENTAL_LEGACY_PRESENT_FORMATS
++            , bForceOpaqueAlpha
++#endif
++        );
++    }
++
++    void BlitHelper::Blit(Resource *pSrc, UINT *pSrcSubresourceIndices, UINT numSrcSubresources, const RECT& srcRect, Resource *pDst, UINT *pDstSubresourceIndices, UINT numDstSubresources, const RECT& dstRect, bool bEnableAlpha, bool bSwapRBChannels
++#ifdef D3D12TL_EXPERIMENTAL_LEGACY_PRESENT_FORMATS
++        , bool bForceOpaqueAlpha
++#endif
++    )
+     {
+         const D3D12_RESOURCE_DESC &dstDesc = pDst->GetUnderlyingResource()->GetDesc();
+         assert( numSrcSubresources <= MAX_PLANES );
+@@ -325,6 +337,18 @@
+             D3D12_SHADER_RESOURCE_VIEW_DESC SRVDesc = {};
+             SRVDesc.Format = ViewFormat;
+             SRVDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++#ifdef D3D12TL_EXPERIMENTAL_LEGACY_PRESENT_FORMATS
++            // D3D9 X8 scan-out has no alpha. Conversion must write opaque alpha
++            // even if the unused storage channel contains arbitrary bits.
++            if (bForceOpaqueAlpha)
++            {
++                SRVDesc.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
++                    D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0,
++                    D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_1,
++                    D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_2,
++                    D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1);
++            }
++#endif
+             if (pSrc->AppDesc()->Samples() > 1)
+             {
+                 SRVDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -88,6 +88,11 @@
+ file(GLOB EXTERNAL_INC ../external/*.h ../external/*.hpp)
+ 
+ add_library(d3d12translationlayer STATIC ${SRC} ${INC} ${INL} ${EXTERNAL_INC})
++
++option(D3D12TL_EXPERIMENTAL_LEGACY_PRESENT_FORMATS "Use actual legacy-present backbuffer metadata and convert incompatible copy formats" OFF)
++if(D3D12TL_EXPERIMENTAL_LEGACY_PRESENT_FORMATS)
++    target_compile_definitions(d3d12translationlayer PUBLIC D3D12TL_EXPERIMENTAL_LEGACY_PRESENT_FORMATS)
++endif()
+ target_include_directories(d3d12translationlayer
+     PUBLIC ../external
+     PUBLIC ../include
+--- a/src/SwapChainHelper.cpp
++++ b/src/SwapChainHelper.cpp
+@@ -17,6 +17,14 @@
+         destArgs.m_appDesc.m_bindFlags = D3D12TranslationLayer::RESOURCE_BIND_RENDER_TARGET;
+         destArgs.m_desc12.SampleDesc.Count = 1;
+         destArgs.m_desc12.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
++#ifdef D3D12TL_EXPERIMENTAL_LEGACY_PRESENT_FORMATS
++        // DXGI may choose a different format from the presenting resource (for
++        // example BGRX is represented by a BGRA flip-model backbuffer). The
++        // wrapper must describe the resource we actually received from DXGI.
++        destArgs.m_desc12 = backBuffer->GetDesc();
++        destArgs.m_appDesc = AppResourceDesc(destArgs.m_desc12,
++            RESOURCE_USAGE_DEFAULT, RESOURCE_CPU_ACCESS_NONE, RESOURCE_BIND_RENDER_TARGET);
++#endif
+         auto destResource = D3D12TranslationLayer::Resource::OpenResource(
+             &context,
+             destArgs,
+@@ -24,6 +32,26 @@
+             D3D12TranslationLayer::DeferredDestructionType::Submission,
+             D3D12_RESOURCE_STATE_COMMON );
+         D3D12_RESOURCE_STATES OperationState;
++#ifdef D3D12TL_EXPERIMENTAL_LEGACY_PRESENT_FORMATS
++        const auto sourceFormat = presentingResource.GetUnderlyingResource()->GetDesc().Format;
++        const auto sourceFamily = CD3D11FormatHelper::GetParentFormat(sourceFormat);
++        const auto destinationFamily = CD3D11FormatHelper::GetParentFormat(destArgs.m_desc12.Format);
++        if (sourceFamily != destinationFamily)
++        {
++            // CopyResource/ResolveSubresource cannot convert between format
++            // families. The existing blitter also resolves an MSAA source and
++            // restores client graphics state after its internal draw.
++            const RECT sourceRect = { 0, 0, static_cast<LONG>(presentingResource.AppDesc()->Width()),
++                static_cast<LONG>(presentingResource.AppDesc()->Height()) };
++            const RECT destinationRect = { 0, 0, static_cast<LONG>(destArgs.m_desc12.Width),
++                static_cast<LONG>(destArgs.m_desc12.Height) };
++            const bool forceOpaqueAlpha = sourceFamily == DXGI_FORMAT_B8G8R8X8_TYPELESS;
++            context.m_BlitHelper.Blit(&presentingResource, 0, sourceRect,
++                destResource.get(), 0, destinationRect, false, false, forceOpaqueAlpha);
++            OperationState = D3D12_RESOURCE_STATE_RENDER_TARGET;
++        }
++        else
++#endif
+         if (presentingResource.AppDesc()->Samples() > 1)
+         {
+             context.ResourceResolveSubresource( destResource.get(), 0, &presentingResource, 0, destArgs.m_appDesc.Format() );

@@ -1,0 +1,161 @@
+--- a/include/ImmediateContext.hpp
++++ b/include/ImmediateContext.hpp
+@@ -2,6 +2,7 @@
+ // Licensed under the MIT License.
+ #pragma once
+ #define D3D12TL_POOLED_BUFFER_UPDATES 1
++#define D3D12TL_GPU_UPLOAD_HEAPS_SUPPORTED 1
+ #include <optional>
+ 
+ namespace D3D12TranslationLayer
+@@ -1481,6 +1482,8 @@
+         return m_nodeIndex;
+     }
+ 
++    bool SupportsGpuUploadHeaps() const noexcept { return m_supportsGpuUpload; }
++    bool m_supportsGpuUpload = false;
+     D3D12_HEAP_PROPERTIES GetHeapProperties(D3D12_HEAP_TYPE Type) const noexcept
+     {
+         if (ComputeOnly())
+@@ -1625,6 +1628,7 @@
+ 
+ private: // Dynamic/staging resource pools
+     TDynamicBufferPool m_UploadBufferPool;
++    TDynamicBufferPool m_GpuUploadBufferPool;
+     TDynamicBufferPool m_ReadbackBufferPool;
+     TDynamicBufferPool m_DecoderBufferPool;
+     TDynamicBufferPool& GetBufferPool(AllocatorHeapType HeapType)
+@@ -1633,6 +1637,8 @@
+         {
+         case AllocatorHeapType::Upload:
+             return m_UploadBufferPool;
++        case AllocatorHeapType::GpuUpload:
++            return m_GpuUploadBufferPool;
+         case AllocatorHeapType::Readback:
+             return m_ReadbackBufferPool;
+         case AllocatorHeapType::Decoder:
+@@ -1671,6 +1677,7 @@
+     // be used for resources that require transitions since transitions
+     // can only be done on the entire heap, not just the suballocated range
+     ConditionalHeapAllocator m_UploadHeapSuballocator;
++    ConditionalHeapAllocator m_GpuUploadHeapSuballocator;
+     ConditionalHeapAllocator m_ReadbackHeapSuballocator;
+     ConditionalHeapAllocator m_DecoderHeapSuballocator;
+     ConditionalHeapAllocator& GetAllocator(AllocatorHeapType HeapType)
+@@ -1679,6 +1686,8 @@
+         {
+         case AllocatorHeapType::Upload:
+             return m_UploadHeapSuballocator;
++        case AllocatorHeapType::GpuUpload:
++            return m_GpuUploadHeapSuballocator;
+         case AllocatorHeapType::Readback:
+             return m_ReadbackHeapSuballocator;
+         case AllocatorHeapType::Decoder:
+--- a/src/ImmediateContext.cpp
++++ b/src/ImmediateContext.cpp
+@@ -67,6 +67,7 @@
+     , m_DirtyStates(e_DirtyOnFirstCommandList)
+     , m_StatesToReassert(e_ReassertOnNewCommandList)
+     , m_UploadBufferPool(min(max((UINT64)args.BufferPoolTrimThreshold, m_MinBufferPoolTrimThreshold), m_MaxBufferPoolTrimThreshold), args.CreatesAndDestroysAreMultithreaded)
++    , m_GpuUploadBufferPool(min(max((UINT64)args.BufferPoolTrimThreshold, m_MinBufferPoolTrimThreshold), m_MaxBufferPoolTrimThreshold), args.CreatesAndDestroysAreMultithreaded)
+     , m_ReadbackBufferPool(min(max((UINT64)args.BufferPoolTrimThreshold, m_MinBufferPoolTrimThreshold), m_MaxBufferPoolTrimThreshold), args.CreatesAndDestroysAreMultithreaded)
+     , m_DecoderBufferPool(min(max((UINT64)args.BufferPoolTrimThreshold, m_MinBufferPoolTrimThreshold), m_MaxBufferPoolTrimThreshold), args.CreatesAndDestroysAreMultithreaded)
+     , m_uStencilRef(0)
+@@ -87,6 +88,11 @@
+         std::forward_as_tuple(this, AllocatorHeapType::Upload),
+         UploadResourceNeedsOwnAllocation)
+ 
++    , m_GpuUploadHeapSuballocator(
++        std::forward_as_tuple(cBuddyMaxBlockSize, UploadHeapBlockSize(), (bool)args.CreatesAndDestroysAreMultithreaded, this, AllocatorHeapType::GpuUpload),
++        std::forward_as_tuple(this, AllocatorHeapType::GpuUpload),
++        UploadResourceNeedsOwnAllocation)
++
+     , m_ReadbackHeapSuballocator(
+         std::forward_as_tuple(cBuddyMaxBlockSize, cBuddyAllocatorThreshold, (bool)args.CreatesAndDestroysAreMultithreaded, this, AllocatorHeapType::Readback),
+         std::forward_as_tuple(this, AllocatorHeapType::Readback),
+@@ -108,6 +114,10 @@
+     , m_architecture(QueryArchitectureFlags())
+ {
+     UNREFERENCED_PARAMETER(debugFlags);
++    D3D12_FEATURE_DATA_D3D12_OPTIONS16 gpuUploadOptions{};
++    m_supportsGpuUpload = !ComputeOnly() && SUCCEEDED(m_pDevice12->CheckFeatureSupport(
++        D3D12_FEATURE_D3D12_OPTIONS16, &gpuUploadOptions, sizeof(gpuUploadOptions))) && gpuUploadOptions.GPUUploadHeapSupported;
++
+     memset(m_BlendFactor, 0, sizeof(m_BlendFactor));
+     memset(m_auVertexOffsets, 0, sizeof(m_auVertexOffsets));
+     memset(m_auVertexStrides, 0, sizeof(m_auVertexStrides));
+@@ -535,6 +545,7 @@
+ bool ImmediateContext::TrimResourcePools()
+ {
+     m_UploadBufferPool.Trim(GetCompletedFenceValue(CommandListType(AllocatorHeapType::Upload)));
++    m_GpuUploadBufferPool.Trim(GetCompletedFenceValue(CommandListType(AllocatorHeapType::GpuUpload)));
+     m_ReadbackBufferPool.Trim(GetCompletedFenceValue(CommandListType(AllocatorHeapType::Readback)));
+     m_DecoderBufferPool.Trim(GetCompletedFenceValue(CommandListType(AllocatorHeapType::Decoder)));
+     for (UINT listType = 0; listType < (UINT)COMMAND_LIST_TYPE::MAX_VALID; ++listType)
+@@ -1064,7 +1075,7 @@
+         bResourceTransitioned = true;
+     }
+ 
+-    if (pDst && !pDst->GetIdentity()->m_bOwnsUnderlyingResource && pDst->GetAllocatorHeapType() == AllocatorHeapType::Upload)
++    if (pDst && !pDst->GetIdentity()->m_bOwnsUnderlyingResource && (pDst->GetAllocatorHeapType() == AllocatorHeapType::Upload || pDst->GetAllocatorHeapType() == AllocatorHeapType::GpuUpload))
+     {
+         m_ResourceStateManager.TransitionResource(pDst, GetDefaultPoolState(pDst->GetAllocatorHeapType()));
+         bResourceTransitioned = true;
+@@ -2912,7 +2923,7 @@
+     ID3D12Resource* copySource = mappableResource.GetResource();
+     UINT64 copySourceOffset = mappableResource.GetOffset();
+     const bool uploadDestination = !pDst->GetIdentity()->m_bOwnsUnderlyingResource &&
+-        pDst->GetAllocatorHeapType() == AllocatorHeapType::Upload;
++        (pDst->GetAllocatorHeapType() == AllocatorHeapType::Upload || pDst->GetAllocatorHeapType() == AllocatorHeapType::GpuUpload);
+     if (pDst->AppDesc()->ResourceDimension() == D3D12_RESOURCE_DIMENSION_BUFFER &&
+         copySource == pDst->GetUnderlyingResource())
+     {
+@@ -4329,6 +4340,7 @@
+     renameResource->ZeroConstantBufferPadding();
+ 
+     assert(renameResource->GetAllocatorHeapType() == AllocatorHeapType::Upload ||
++        renameResource->GetAllocatorHeapType() == AllocatorHeapType::GpuUpload ||
+         renameResource->GetAllocatorHeapType() == AllocatorHeapType::Decoder);
+ 
+     assert(renameResource->GetAllocatorHeapType() == pResource->GetAllocatorHeapType());
+@@ -5683,6 +5695,13 @@
+         GetDefaultPoolState(heapType),
+         nullptr,
+         IID_PPV_ARGS(&spResource));
++    if (FAILED(hr) && heapType == AllocatorHeapType::GpuUpload)
++    {
++        // Preserve allocation success under local-memory pressure.
++        Props = GetHeapProperties(D3D12_HEAP_TYPE_UPLOAD);
++        hr = m_pDevice12->CreateCommittedResource(&Props, D3D12_HEAP_FLAG_NONE, &Desc,
++            GetDefaultPoolState(heapType), nullptr, IID_PPV_ARGS(&spResource));
++    }
+     ThrowFailure(hr); // throw( _com_error )
+ 
+     // Cache the Map within the D3D12 resource.
+--- a/include/Util.hpp
++++ b/include/Util.hpp
+@@ -33,6 +33,7 @@
+         Upload,
+         Readback,
+         Decoder,
++        GpuUpload,
+     };
+ 
+     inline COMMAND_LIST_TYPE CommandListType(AllocatorHeapType HeapType)
+@@ -55,6 +56,8 @@
+         {
+         case AllocatorHeapType::Readback:
+             return D3D12_HEAP_TYPE_READBACK;
++        case AllocatorHeapType::GpuUpload:
++            return D3D12_HEAP_TYPE_GPU_UPLOAD;
+ 
+         case AllocatorHeapType::Upload:
+         case AllocatorHeapType::Decoder:
+@@ -489,6 +492,7 @@
+         switch (heapType)
+         {
+         case AllocatorHeapType::Upload:
++        case AllocatorHeapType::GpuUpload:
+             return D3D12_RESOURCE_STATE_GENERIC_READ;
+         case AllocatorHeapType::Readback:
+             return D3D12_RESOURCE_STATE_COPY_DEST;

@@ -380,6 +380,7 @@ namespace D3D9on12
 
         UINT subresourceIndices[MAX_PLANES];
         UINT numPlanes;
+        pResource->MarkGpuWritten();
         pResource->ConvertAppSubresourceToDX12SubresourceIndices(pColorFill->SubResourceIndex, subresourceIndices, numPlanes);
 
         if (numPlanes == 1)
@@ -625,7 +626,6 @@ namespace D3D9on12
         m_numSubresources(0),
         m_numArrayLevels(0),
         m_renderTargetViews(),
-        m_isD3D9SystemMemoryPool(false),
         m_ID(InterlockedIncrement(&g_globalResourceID)),
         m_pBackingShaderResource(nullptr),
         m_dx9Format(D3DFMT_UNKNOWN),
@@ -639,50 +639,89 @@ namespace D3D9on12
         memset(&m_TranslationLayerCreateArgs, 0, sizeof(m_TranslationLayerCreateArgs));
     }
 
+    void Resource::UnbindPipelineReferences(PipelineState& pipeline)
+    {
+        while (GetSRVBindingTracker().GetBindingMask())
+        {
+            ThrowFailure(pipeline.GetPixelStage().SetSRV(*m_pParentDevice, nullptr, GetSRVBindingTracker().FirstBoundIndex()));
+        }
+
+        const BoundRenderTarget nullRenderTarget(nullptr, 0);
+        while (GetRTVBindingTracker().GetBindingMask())
+        {
+            pipeline.GetPixelStage().SetRenderTarget(GetRTVBindingTracker().FirstBoundIndex(), nullRenderTarget);
+        }
+
+        while (GetVBBindingTracker().IsBound())
+        {
+            pipeline.GetInputAssembly().SetVertexBuffer(
+                *m_pParentDevice, nullptr, GetVBBindingTracker().FirstBoundIndex(), 0, 0);
+        }
+
+        if (GetDSVBindingTracker().IsBound())
+        {
+            assert(GetDSVBindingTracker().GetBindingMask() == 1);
+            pipeline.GetPixelStage().SetDepthStencil(nullptr);
+        }
+
+        if (GetIBBindingTracker().IsBound())
+        {
+            assert(GetIBBindingTracker().GetBindingMask() == 1);
+            pipeline.GetInputAssembly().SetIndexBuffer(*m_pParentDevice, nullptr, 0);
+        }
+
+    }
+
     Resource::~Resource()
     {
+        if (m_pParentDevice
+        )
+        {
+            m_pParentDevice->UnregisterInteropResource(this);
+        }
         if (m_pBackingShaderResource)
         {
             delete m_pBackingShaderResource;
         }
 
-        // This must be called before the views are destroyed
-        m_pParentDevice->GetContext().ClearInputBindings(m_pResource.get());
-        m_pParentDevice->GetContext().ClearOutputBindings(m_pResource.get());
-
-        while (GetSRVBindingTracker().GetBindingIndices().size())
+#if defined(D3D9ON12_BATCHED_RENDERING)
+        const bool deferTeardown = m_pParentDevice->GetBatchedContext() != nullptr;
+        if (!deferTeardown)
+#endif
         {
-            ThrowFailure(m_pParentDevice->GetPipelineState().GetPixelStage().SetSRV(*m_pParentDevice, nullptr, GetSRVBindingTracker().GetBindingIndices()[0]));
+            // This must be called before the views are destroyed. Teardown must still
+            // drain queued work after a worker error, without throwing.
+            auto& context = m_pParentDevice->GetContextForDestruction();
+            context.ClearInputBindings(m_pResource.get());
+            context.ClearOutputBindings(m_pResource.get());
         }
 
-        const BoundRenderTarget nullRenderTarget(nullptr, 0);
-        while (GetRTVBindingTracker().GetBindingIndices().size())
-        {
-            m_pParentDevice->GetPipelineState().GetPixelStage().SetRenderTarget(GetRTVBindingTracker().GetBindingIndices()[0], nullRenderTarget);
-        }
+        UnbindPipelineReferences(m_pParentDevice->GetPipelineState());
 
-        while (GetVBBindingTracker().GetBindingIndices().size())
+#if defined(D3D9ON12_BATCHED_RENDERING)
+        if (deferTeardown)
         {
-            m_pParentDevice->GetPipelineState().GetInputAssembly().SetVertexBuffer(
-                *m_pParentDevice, 
-                nullptr, 
-                GetVBBindingTracker().GetBindingIndices()[0], 
-                0, 
-                0);
+            // Queued packets may still name the views and the resource: unbind and destroy them on the worker
+            // after the current batch, in order, instead of draining the worker on the DDI thread.
+            std::vector<D3D12TranslationLayer::RTV*> rtvs; std::vector<D3D12TranslationLayer::SRV*> srvs; std::vector<D3D12TranslationLayer::DSV*> dsvs;
+            for (auto& view : m_renderTargetViews) if (view) rtvs.push_back(view.release());
+            for (auto& view : m_SRGBRenderTargetViews) if (view) rtvs.push_back(view.release());
+            for (auto& view : m_shaderResourceViews) if (view) srvs.push_back(view.release());
+            for (UINT i = 0; i < _countof(g_cPossibleDepthStencilStates); i++) { if (m_pDepthStencilViews[i]) { dsvs.push_back(m_pDepthStencilViews[i]); m_pDepthStencilViews[i] = nullptr; } }
+            m_pParentDevice->m_lockedResourceRanges.GetLocked()->erase(this);
+            D3D12TranslationLayer::Resource* pResource = m_pResource.release();
+            D3D12TranslationLayer::ImmediateContext* pContext = &m_pParentDevice->GetContextNoDrain();
+            m_pParentDevice->GetBatchedContext()->AddPostBatchFunction([pContext, pResource, rtvs = std::move(rtvs), srvs = std::move(srvs), dsvs = std::move(dsvs)]()
+            {
+                if (pResource) { CleanupTranslationLayerResourceBindings(*pContext, *pResource); }
+                for (auto* view : rtvs) delete view;
+                for (auto* view : srvs) delete view;
+                for (auto* view : dsvs) delete view; // heap-allocated when batching (see the DSV creation)
+                if (pResource) { pResource->Release(); }
+            });
+            return;
         }
-
-        if (GetDSVBindingTracker().IsBound())
-        {
-            assert(GetDSVBindingTracker().GetBindingIndices().size() == 1);
-            m_pParentDevice->GetPipelineState().GetPixelStage().SetDepthStencil(nullptr);
-        }
-
-        if (GetIBBindingTracker().IsBound())
-        {
-            assert(GetIBBindingTracker().GetBindingIndices().size() == 1);
-            m_pParentDevice->GetPipelineState().GetInputAssembly().SetIndexBuffer(*m_pParentDevice, nullptr, 0);
-        }
-
+#endif
         for (UINT i = 0; i < _countof(g_cPossibleDepthStencilStates); i++)
         {
             if (m_pDepthStencilViews[i])
@@ -704,6 +743,14 @@ namespace D3D9on12
 
     void Resource::CreateUnderlyingResource(D3D12TranslationLayer::ResourceCreationArgs& createArgs)
     {
+#if defined(D3D9ON12_BATCHED_RENDERING)
+        if (m_pParentDevice->GetBatchedContext())
+        {
+            // Streaming creates hundreds of resources in a frame; each must not wait for the worker to drain.
+            m_pResource = D3D12TranslationLayer::Resource::CreateResource(&m_pParentDevice->GetContextNoDrain(), createArgs, D3D12TranslationLayer::ResourceAllocationContext::FreeThread); // throw( bad_alloc, _com_error )
+            return;
+        }
+#endif
         m_pResource = D3D12TranslationLayer::Resource::CreateResource(&m_pParentDevice->GetContext(), createArgs, D3D12TranslationLayer::ResourceAllocationContext::ImmediateContextThreadLongLived); // throw( bad_alloc, _com_error )
     }
 
@@ -789,6 +836,17 @@ namespace D3D9on12
         }
 
         const bool bIsDisplayable = createArgs.Flags.Primary;
+        if (bIsDisplayable && !m_pParentDevice->GetAdapter().m_bSupportsNewPresent && !m_pParentDevice->SupportsPrivatePresent())
+        {
+            // Fullscreen back buffers are primaries the runtime flips through its own D3DKMT_PRESENT. Without
+            // the runtime's present callback (private interface version 1, the shipping d3d9.dll) they are
+            // presented through the D3D12 runtime's private present interfaces (Device::PrivatePresent); when
+            // those are missing too the only remaining path is a DXGI swap chain on a window, which DXGI
+            // refuses for the window the runtime holds in (emulated) fullscreen ownership, so every present
+            // would fail and the runtime would report D3DERR_WASSTILLDRAWING for ever. Refusing the primary
+            // fails the fullscreen device creation (or Reset) cleanly instead.
+            return E_NOTIMPL;
+        }
         m_dx9Format = createArgs.Format == D3DDDIFMT_UNKNOWN ? GetDefaultFormat(createArgs.Flags) : ConvertDDIFormatToAPI(createArgs.Format);
         // X8R8G8B8 is not a DISPLAYABLE format in DX12, but we can emulate it with the compatible D3DFMT_A8R8G8B8
         if (bIsDisplayable && m_dx9Format == D3DFMT_X8R8G8B8)
@@ -902,7 +960,7 @@ namespace D3D9on12
 
         // If unrestricted pitch is supported, we can use tighter packing for non-planar resources
         // instead of the default 256-byte alignment that GetCopyableFootprints applies
-        if (m_pParentDevice->GetContext().GetOptions13().UnrestrictedBufferTextureCopyPitchSupported && m_NonOpaquePlaneCount == 1)
+        if (m_pParentDevice->GetContextNoDrain().GetOptions13().UnrestrictedBufferTextureCopyPitchSupported && m_NonOpaquePlaneCount == 1)
         {
             m_totalSize = 0;
             for (UINT subresourceIndex = 0; subresourceIndex < m_numSubresources; subresourceIndex++)
@@ -1047,8 +1105,21 @@ namespace D3D9on12
             const D3D12TranslationLayer::RESOURCE_USAGE UsageFlag = GetResourceUsage(createArgs.Flags, m_CpuAccessFlags);
             D3D12_HEAP_TYPE HeapType = D3D12TranslationLayer::Resource::GetD3D12HeapType(UsageFlag, m_CpuAccessFlags);
             // We've seen some apps such as Unigine Valley experience corruption on systems with UMA when switching to HeapTypeDefault here, so skipping this optimization in that case for now
-            bool isUMA = m_pParentDevice->GetContext().m_architecture.isUMA;
-            if (!isUMA && 
+            bool isUMA = m_pParentDevice->GetContextNoDrain().m_architecture.isUMA;
+            bool useSmallStaticUpload = false;
+#if defined(D3D12TL_GPU_UPLOAD_HEAPS_SUPPORTED)
+            static const bool gpuStaticUpload = [] {
+                char value[2]{};
+                return !(GetEnvironmentVariableA("D3D9ON12_GPU_UPLOAD_STATIC", value, ARRAYSIZE(value)) == 1 && value[0] == '0');
+            }();
+            // Retain GPU-local reads while amortizing small static buffer creation
+            // over a dedicated CPU-visible video-memory pool when supported.
+            useSmallStaticUpload = gpuStaticUpload && m_pParentDevice->GetContextNoDrain().SupportsGpuUploadHeaps() &&
+                HeapType == D3D12_HEAP_TYPE_UPLOAD && (createArgs.Flags.VertexBuffer || createArgs.Flags.IndexBuffer) &&
+                createArgs.Flags.HintStatic && createArgs.Flags.WriteOnly && !createArgs.Flags.SharedResource && m_desc.Width <= 65536;
+#endif
+            m_initialUploadMapAllowed = useSmallStaticUpload;
+            if (!isUMA && !useSmallStaticUpload &&
                 HeapType == D3D12_HEAP_TYPE_UPLOAD &&
                 (createArgs.Flags.VertexBuffer || createArgs.Flags.IndexBuffer) &&
                 createArgs.Flags.HintStatic)
@@ -1056,12 +1127,16 @@ namespace D3D9on12
                 HeapType = D3D12_HEAP_TYPE_DEFAULT;
             }
 
+#if defined(D3D12TL_GPU_UPLOAD_HEAPS_SUPPORTED)
+            if (useSmallStaticUpload)
+                m_TranslationLayerCreateArgs.m_heapType = D3D12TranslationLayer::AllocatorHeapType::GpuUpload;
+#endif
             m_TranslationLayerCreateArgs.m_desc12 = m_desc;
             m_TranslationLayerCreateArgs.m_appDesc = ConvertToAppResourceDesc(m_desc,
                 UsageFlag,
                 (D3D12TranslationLayer::RESOURCE_CPU_ACCESS)m_CpuAccessFlags,
                 (D3D12TranslationLayer::RESOURCE_BIND_FLAGS)bindFlags);
-            m_TranslationLayerCreateArgs.m_heapDesc = CD3DX12_HEAP_DESC(m_pParentDevice->GetDevice().GetResourceAllocationInfo(0, 1, &m_desc),
+            m_TranslationLayerCreateArgs.m_heapDesc = CD3DX12_HEAP_DESC(m_pParentDevice->GetResourceAllocationInfo(m_desc),
                 CD3DX12_HEAP_PROPERTIES(HeapType),
                 createArgs.Flags.SharedResource ? D3D12_HEAP_FLAG_SHARED : D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT);
             m_TranslationLayerCreateArgs.m_bBoundForStreamOut = false;
@@ -1116,6 +1191,16 @@ namespace D3D9on12
             }
             else
             {
+                PlacedResourcePool* pPlacedPool = m_pParentDevice->GetPlacedResourcePool();
+                if (pPlacedPool && pPlacedPool->Accepts(m_TranslationLayerCreateArgs.m_desc12, m_TranslationLayerCreateArgs.m_heapDesc))
+                {
+                    // Small static buffers and textures are placed in pooled heaps instead of one committed allocation each.
+                    m_TranslationLayerCreateArgs.m_PrivateCreateFn = [pPlacedPool](const D3D12TranslationLayer::ResourceCreationArgs& args, ID3D12SwapChainAssistant*, ID3D12Resource** ppResource)
+                    {
+                        ThrowFailure(pPlacedPool->Create(args.m_desc12, args.m_heapDesc, ppResource));
+                    };
+                    m_TranslationLayerCreateArgs.m_bManageResidency = false; // the pool keeps its heaps resident
+                }
                 CreateUnderlyingResource(m_TranslationLayerCreateArgs, createArgs);
             }
 
@@ -1222,7 +1307,7 @@ namespace D3D9on12
 
             // From MSDN: D3DRS_SRGBWRITEENABLE is honored while performing a clear of the render target
             bool srgbEnabled = m_pParentDevice->GetPipelineState().GetPixelStage().GetSRGBWriteEnable();
-            m_pParentDevice->GetContext().ClearRenderTargetView(GetRenderTargetView(SubResourceIndex, srgbEnabled), (float*)&col, numRects, dstRects);
+            m_pParentDevice->GetResourceCommandContext().ClearRenderTargetView(GetRenderTargetView(SubResourceIndex, srgbEnabled), (float*)&col, numRects, dstRects);
         }
         
         else
@@ -1249,7 +1334,7 @@ namespace D3D9on12
             clearFlag |= D3D12_CLEAR_FLAG_STENCIL;
         }
 
-        m_pParentDevice->GetContext().ClearDepthStencilView(m_pDepthStencilViews[D3D12_DSV_FLAG_NONE], clearFlag, depthValue, static_cast<UINT8>(stencilValue), numRects, dstRects);
+        m_pParentDevice->GetResourceCommandContext().ClearDepthStencilView(m_pDepthStencilViews[D3D12_DSV_FLAG_NONE], clearFlag, depthValue, static_cast<UINT8>(stencilValue), numRects, dstRects);
 
         return S_OK;
     }
@@ -1339,6 +1424,29 @@ namespace D3D9on12
         }
 
         Check9on12(!IsSystemMemory()); // System memory should only use notify only
+
+        if (!bAsyncLock && UsesCpuShadowForLocks())
+        {
+            D3D12_BOX* pShadowBox = nullptr;
+            if (IsLockingSubrange<D3DDDI_LOCKFLAGS>(flags))
+            {
+                pShadowBox = &m_lockData[subresourceIndex].m_Box;
+                if (flags.AreaValid) *pShadowBox = CD3DX12_BOX(lockRange.Area.left, lockRange.Area.top, lockRange.Area.right, lockRange.Area.bottom);
+                else if (flags.BoxValid) *pShadowBox = CD3DX12_BOX(lockRange.Box.Left, lockRange.Box.Top, lockRange.Box.Front, lockRange.Box.Right, lockRange.Box.Bottom, lockRange.Box.Back);
+                else *pShadowBox = CD3DX12_BOX(lockRange.Range.Offset, lockRange.Range.Size + lockRange.Range.Offset);
+                pShadowBox->left = min(pShadowBox->left, (UINT)m_logicalDesc.Width); pShadowBox->right = min(pShadowBox->right, (UINT)m_logicalDesc.Width);
+                pShadowBox->top = min(pShadowBox->top, m_logicalDesc.Height); pShadowBox->bottom = min(pShadowBox->bottom, m_logicalDesc.Height);
+                pShadowBox->front = min(pShadowBox->front, (UINT)m_logicalDesc.DepthOrArraySize); pShadowBox->back = min(pShadowBox->back, (UINT)m_logicalDesc.DepthOrArraySize);
+            }
+            pSurfData = CpuShadowPointer(subresourceIndex, pShadowBox, pitch, slicePitch);
+            if (!flags.ReadOnly)
+            {
+                NotifyResourceChanged();
+            }
+            m_lockData[subresourceIndex].m_UsedCpuShadow = true;
+            m_lockData[subresourceIndex].m_LockCount++;
+            return S_OK;
+        }
 
         D3D12TranslationLayer::MAP_TYPE mapType = D3D12TranslationLayer::MAP_TYPE_READ;
 
@@ -1507,6 +1615,21 @@ namespace D3D9on12
             pitch = m_pResource->GetSubresourcePlacement(subresourceIndex).Footprint.RowPitch;
             slicePitch = static_cast<UINT>(m_pResource->DepthPitch(subresourceIndex));
         }
+        else if ((m_initialUploadMapAllowed || m_directUploadMap) &&
+            !m_LastRenamedResource.GetResource() &&
+            (mapType == D3D12TranslationLayer::MAP_TYPE_WRITE || mapType == D3D12TranslationLayer::MAP_TYPE_WRITE_NOOVERWRITE))
+        {
+            // No GPU command has named this buffer yet. Its upload slice can be
+            // initialized directly without waiting for unrelated queued work.
+            if (!m_directUploadMap)
+            {
+                CD3DX12_RANGE readRange(0, 0);
+                ThrowFailure(m_pResource->GetUnderlyingResource()->Map(0, &readRange, &m_directUploadMap));
+            }
+            pSurfData = static_cast<BYTE*>(m_directUploadMap) + m_pResource->GetSubresourcePlacement(0).Offset + (pBox ? pBox->left : 0);
+            pitch = m_pResource->GetSubresourcePlacement(0).Footprint.RowPitch;
+            slicePitch = static_cast<UINT>(m_pResource->DepthPitch(0));
+        }
         else
         {
             D3D12TranslationLayer::MappedSubresource mappedData = {};
@@ -1543,6 +1666,34 @@ namespace D3D9on12
         }
         Check9on12(m_lockData[subresourceIndex].m_LockCount > 0);
         m_lockData[subresourceIndex].m_LockCount--;
+        if (m_directUploadMap)
+        {
+            if (!m_lockData[subresourceIndex].m_LockCount)
+            {
+                const SIZE_T offset = static_cast<SIZE_T>(m_pResource->GetSubresourcePlacement(0).Offset);
+                const CD3DX12_RANGE writtenRange(offset, offset + static_cast<SIZE_T>(m_desc.Width));
+                m_pResource->GetUnderlyingResource()->Unmap(0, &writtenRange);
+                m_directUploadMap = nullptr;
+            }
+            return;
+        }
+
+        if (m_lockData[subresourceIndex].m_UsedCpuShadow)
+        {
+            if (m_lockData[subresourceIndex].m_LockCount == 0)
+            {
+                m_lockData[subresourceIndex].m_UsedCpuShadow = false;
+                const D3DDDI_LOCKFLAGS& shadowFlags = m_lockData[subresourceIndex].m_Flags;
+                if (!shadowFlags.ReadOnly && !m_cpuShadow.empty() && !m_cpuShadow[subresourceIndex].empty())
+                {
+                    const D3D12_BOX* pBox = IsLockingSubrange<D3DDDI_LOCKFLAGS>(shadowFlags) ? &m_lockData[subresourceIndex].m_Box : nullptr;
+                    UINT pitch = 0, slicePitch = 0;
+                    BYTE* pData = CpuShadowPointer(subresourceIndex, pBox, pitch, slicePitch);
+                    device.GetRenderContext().ResourceUpdateSubresourceUP(m_pResource.get(), subresourceIndex, pBox, pData, pitch, slicePitch);
+                }
+            }
+            return;
+        }
 
         const D3DDDI_LOCKFLAGS &lockFlags = m_lockData[subresourceIndex].m_Flags;
         bool bLockingSubrange = IsLockingSubrange<D3DDDI_LOCKFLAGS>(lockFlags);
@@ -1562,6 +1713,48 @@ namespace D3D9on12
             D3D12TranslationLayer::MAP_TYPE mapType = GetMapTypeFlag(lockFlags.ReadOnly, lockFlags.WriteOnly, lockFlags.Discard, lockFlags.NoOverwrite, m_isDecodeCompressedBuffer, pResourceToUnmap->AppDesc()->CPUAccessFlags());
             device.GetContext().Unmap(pResourceToUnmap, subresourceIndex, mapType, pReadWriteBox);
         }
+    }
+
+    bool Resource::UsesCpuShadowForLocks() const
+    {
+        // Textures, and buffers the driver placed in a DEFAULT heap (static vertex/index data): for both the translation
+        // layer's non-DISCARD Map is a readback copy plus a GPU wait. Buffers in UPLOAD heaps keep the direct map.
+        const bool defaultHeapBuffer = m_logicalDesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+            m_TranslationLayerCreateArgs.m_heapDesc.Properties.Type == D3D12_HEAP_TYPE_DEFAULT;
+        return m_IsLockable && !m_gpuWritten && !m_isD3D9SystemMemoryPool && !m_isDecodeCompressedBuffer &&
+            (m_logicalDesc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || defaultHeapBuffer) && m_NonOpaquePlaneCount == 1 &&
+            m_logicalDesc.SampleDesc.Count == 1 && !m_mipMapsHiddenFromApp && m_pResource.get() != nullptr &&
+            !m_physicalLinearRepresentation.m_footprints.empty();
+    }
+
+    BYTE* Resource::CpuShadowPointer(UINT subresourceIndex, const D3D12_BOX* pBox, UINT& pitch, UINT& slicePitch)
+    {
+        const auto& footprint = m_physicalLinearRepresentation.m_footprints[subresourceIndex].Footprint;
+        const UINT rows = m_physicalLinearRepresentation.m_numRows[subresourceIndex];
+        pitch = footprint.RowPitch;
+        slicePitch = pitch * rows;
+        if (m_cpuShadow.empty())
+        {
+            m_cpuShadow.resize(m_numSubresources);
+        }
+        std::vector<BYTE>& shadow = m_cpuShadow[subresourceIndex];
+        if (shadow.empty())
+        {
+            shadow.resize(static_cast<size_t>(slicePitch) * max(footprint.Depth, 1u)); // zero: a never-written texture has undefined contents in D3D9
+        }
+        BYTE* pData = shadow.data();
+        if (pBox && m_logicalDesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+        {
+            pData += pBox->left; // byte offset
+        }
+        else if (pBox)
+        {
+            const DXGI_FORMAT format = footprint.Format;
+            const UINT blockWidth = IsBlockCompressedFormat(format) ? GetBlockWidth(format) : 1;
+            const UINT blockHeight = blockWidth; // D3D block-compressed formats use square 4x4 blocks
+            pData += static_cast<size_t>(pBox->front) * slicePitch + static_cast<size_t>(pBox->top / blockHeight) * pitch + static_cast<size_t>(pBox->left / blockWidth) * GetBytesPerUnit(format);
+        }
+        return pData;
     }
 
     HRESULT Resource::PreBind()
@@ -1826,13 +2019,13 @@ namespace D3D9on12
 
                 rtvDesc.Format = rtvFormat;
                 m_renderTargetViews[subresourceIndex] = std::unique_ptr<D3D12TranslationLayer::RTV>(
-                    new D3D12TranslationLayer::RTV(&m_pParentDevice->GetContext(), rtvDesc, *m_pResource));
+                    new D3D12TranslationLayer::RTV(&m_pParentDevice->GetContextNoDrain(), rtvDesc, *m_pResource));
 
                 if (GenerateSRGBRTV)
                 {
                     rtvDesc.Format = ConvertToSRGB(rtvFormat);
                     m_SRGBRenderTargetViews[subresourceIndex] = std::unique_ptr<D3D12TranslationLayer::RTV>(
-                        new D3D12TranslationLayer::RTV(&m_pParentDevice->GetContext(), rtvDesc, *m_pResource));
+                        new D3D12TranslationLayer::RTV(&m_pParentDevice->GetContextNoDrain(), rtvDesc, *m_pResource));
                 }
                 subresourceIndex++;
             }
@@ -1853,7 +2046,7 @@ namespace D3D9on12
         {
             viewDesc.ArraySlice= arraySlice;
             m_videoDecoderOutputViews[arraySlice] = std::unique_ptr<D3D12TranslationLayer::VDOV>(
-                new D3D12TranslationLayer::VDOV(&m_pParentDevice->GetContext(), viewDesc, *m_pResource));
+                new D3D12TranslationLayer::VDOV(&m_pParentDevice->GetContextNoDrain(), viewDesc, *m_pResource));
         }
     }
 
@@ -1873,7 +2066,7 @@ namespace D3D9on12
         {
             viewDesc.FirstArraySlice = arraySlice;
             m_videoProcessorOutputViews[arraySlice] = std::unique_ptr<D3D12TranslationLayer::VPOV>(
-                new D3D12TranslationLayer::VPOV(&m_pParentDevice->GetContext(), viewDesc, *m_pResource));
+                new D3D12TranslationLayer::VPOV(&m_pParentDevice->GetContextNoDrain(), viewDesc, *m_pResource));
         }
     }
 
@@ -1927,7 +2120,15 @@ namespace D3D9on12
                 }
             }
 
-            m_pDepthStencilViews[i] = new (m_depthStencilViewSpace + i * sizeof(D3D12TranslationLayer::DSV)) D3D12TranslationLayer::DSV(&m_pParentDevice->GetContext(), dsvDesc, *m_pResource);
+#if defined(D3D9ON12_BATCHED_RENDERING)
+            if (m_pParentDevice->GetBatchedContext())
+            {
+                // Heap-allocated so the view can be destroyed on the worker after the batch that may still bind it.
+                m_pDepthStencilViews[i] = new D3D12TranslationLayer::DSV(&m_pParentDevice->GetContextNoDrain(), dsvDesc, *m_pResource);
+            }
+            else
+#endif
+            m_pDepthStencilViews[i] = new (m_depthStencilViewSpace + i * sizeof(D3D12TranslationLayer::DSV)) D3D12TranslationLayer::DSV(&m_pParentDevice->GetContextNoDrain(), dsvDesc, *m_pResource);
         }
     }
 
@@ -2054,7 +2255,7 @@ namespace D3D9on12
             }
         }
 
-        return new D3D12TranslationLayer::SRV(&m_pParentDevice->GetContext(), srvDesc, *m_pResource);
+        return new D3D12TranslationLayer::SRV(&m_pParentDevice->GetContextNoDrain(), srvDesc, *m_pResource);
     }
 
     UINT8 Resource::GetArraySize()
@@ -2131,7 +2332,7 @@ namespace D3D9on12
         device.GetContext().DeleteRenameCookie(reinterpret_cast<D3D12TranslationLayer::Resource*>(arg.hCookie));
 
         // Discard resources should never be RTVs or DSVs
-        Check9on12(GetRTVBindingTracker().GetBindingIndices().size() == 0 && GetDSVBindingTracker().GetBindingIndices().size() == 0);
+        Check9on12(GetRTVBindingTracker().GetBindingMask() == 0 && GetDSVBindingTracker().GetBindingMask() == 0);
 
         // The rotation mechanism used by rename ensures SRVs are updated before they're used, and future draws will reference the new resource.
 
@@ -2174,6 +2375,14 @@ namespace D3D9on12
         CleanupTranslationLayerResourceBindings(*pResource->m_pParent, *pResource);
         pResource->Release();
     }
+#if defined(D3D9ON12_BATCHED_RENDERING)
+    void CleanupBatchedInputResourceAndRelease::operator()(D3D12TranslationLayer::Resource* pResource)
+    {
+        // Temporary triangle-fan index buffers may die immediately after a queued draw.
+        m_device->GetContextForDestruction();
+        CleanupResourceBindingsAndRelease{}(pResource);
+    }
+#endif
 
     void APIENTRY TransitionResource(HANDLE hDD, HANDLE hResource, UINT State)
     {

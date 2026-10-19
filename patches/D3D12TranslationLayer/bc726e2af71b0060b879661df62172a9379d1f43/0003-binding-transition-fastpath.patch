@@ -1,0 +1,102 @@
+diff --git a/include/ResourceState.hpp b/include/ResourceState.hpp
+index 8f4f33c..557471b 100644
+--- a/include/ResourceState.hpp
++++ b/include/ResourceState.hpp
+@@ -458,6 +458,13 @@ constexpr D3D12_RESOURCE_STATES RESOURCE_STATE_ALL_WRITE_BITS =
+                                    SubresourceTransitionFlags Flags = SubresourceTransitionFlags::None) noexcept;
+         // Update destination state of a resource to correspond to the resource's bind points.
+         void TransitionResourceForBindings(Resource* pResource) noexcept;
++#ifdef D3D12TL_BINDING_TRANSITION_FASTPATH
++        // True when a binding-driven transition request would be a complete no-op:
++        // the whole resource is already exclusively in a state that covers the desired
++        // one on the graphics queue, and it was already accounted (fence, residency,
++        // used-in-command-list) in the current graphics command list.
++        bool IsBindingTransitionRedundant(Resource* pResource, D3D12_RESOURCE_STATES Desired) const noexcept;
++#endif
+         // Update destination state of specified subresources to correspond to the resource's bind points.
+         void TransitionSubresourcesForBindings(Resource* pResource,
+                                                CViewSubresourceSubset const& Subresources) noexcept;
+diff --git a/src/ResourceState.cpp b/src/ResourceState.cpp
+index ce6f32d..e413c57 100644
+--- a/src/ResourceState.cpp
++++ b/src/ResourceState.cpp
+@@ -1011,12 +1011,62 @@ namespace D3D12TranslationLayer
+     }
+ 
+     //----------------------------------------------------------------------------------------------------------------------------------
++#ifdef D3D12TL_BINDING_TRANSITION_FASTPATH
++    bool ResourceStateManager::IsBindingTransitionRedundant(Resource* pResource, D3D12_RESOURCE_STATES Desired) const noexcept
++    {
++        // A pending request must keep going through the list so it can be replaced/cancelled.
++        if (pResource->IsTransitionPending())
++        {
++            return false;
++        }
++        // Fully unbound: the request would be recorded as UNKNOWN and dropped unprocessed.
++        if (Desired == UNKNOWN_RESOURCE_STATE)
++        {
++            return true;
++        }
++        if (pResource->m_bTriggersSwapchainDeferredWaits || !pResource->m_ResourceDeferredWaits.empty())
++        {
++            return false;
++        }
++        auto& Current = pResource->GetIdentity()->m_currentState;
++        if (Current.SupportsSimultaneousAccess() || !Current.AreAllSubresourcesSame() || !Current.IsExclusiveState(0))
++        {
++            return false;
++        }
++        auto const& Exclusive = Current.GetExclusiveSubresourceState(0);
++        if (Exclusive.CommandListType != COMMAND_LIST_TYPE::GRAPHICS ||
++            (Exclusive.State & Desired) != Desired)
++        {
++            return false;
++        }
++        // Same command list as the last accounted use: fence, residency set and
++        // used-in-command-list bookkeeping are already up to date. Both the state
++        // fence and the resource's own last-used ID must match (some paths update
++        // the state fence without going through UsedInCommandList).
++        CommandListManager* pManager = m_ImmCtx.GetCommandListManager(COMMAND_LIST_TYPE::GRAPHICS);
++        if (!pManager)
++        {
++            return false;
++        }
++        const UINT64 CurrentID = pManager->GetCommandListID();
++        return Exclusive.FenceValue == CurrentID &&
++            pResource->m_LastUsedCommandListID[(UINT)COMMAND_LIST_TYPE::GRAPHICS] == CurrentID;
++    }
++#endif
++
+     void ResourceStateManager::TransitionResourceForBindings(Resource* pResource) noexcept
+     {
+         auto& Bindings = pResource->GetBindingState();
+         if (Bindings.AreAllSubresourcesTheSame())
+         {
+-            TransitionResource(pResource, Bindings.GetD3D12ResourceUsageFromBindings(0), COMMAND_LIST_TYPE::GRAPHICS, SubresourceTransitionFlags::TransitionPreDraw);
++            D3D12_RESOURCE_STATES Desired = Bindings.GetD3D12ResourceUsageFromBindings(0);
++#ifdef D3D12TL_BINDING_TRANSITION_FASTPATH
++            if (IsBindingTransitionRedundant(pResource, Desired))
++            {
++                return;
++            }
++#endif
++            TransitionResource(pResource, Desired, COMMAND_LIST_TYPE::GRAPHICS, SubresourceTransitionFlags::TransitionPreDraw);
+         }
+         else
+         {
+@@ -1033,7 +1083,14 @@ namespace D3D12TranslationLayer
+         auto& Bindings = pResource->GetBindingState();
+         if (Bindings.AreAllSubresourcesTheSame())
+         {
+-            TransitionResource(pResource, Bindings.GetD3D12ResourceUsageFromBindings(0), COMMAND_LIST_TYPE::GRAPHICS, SubresourceTransitionFlags::TransitionPreDraw);
++            D3D12_RESOURCE_STATES Desired = Bindings.GetD3D12ResourceUsageFromBindings(0);
++#ifdef D3D12TL_BINDING_TRANSITION_FASTPATH
++            if (IsBindingTransitionRedundant(pResource, Desired))
++            {
++                return;
++            }
++#endif
++            TransitionResource(pResource, Desired, COMMAND_LIST_TYPE::GRAPHICS, SubresourceTransitionFlags::TransitionPreDraw);
+         }
+         else
+         {

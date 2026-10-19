@@ -223,6 +223,9 @@ namespace D3D9on12
 
     VideoProcessDevice::~VideoProcessDevice()
     {
+#if defined(D3D9ON12_BATCHED_RENDERING)
+        m_pParentDevice->GetContextForDestruction();
+#endif
         if (m_pUnderlyingVideoProcess)
         {
             m_pUnderlyingVideoProcess->~VideoProcess();
@@ -430,6 +433,9 @@ namespace D3D9on12
             SetFilter(D3D12_VIDEO_PROCESS_FILTER_SATURATION, pStreamDesc, pStreamArguments, VideoTranslate::FromFixed32<INT>(pBlit->ProcAmpValues.Saturation));
         }
 
+#if defined(D3D9ON12_BATCHED_RENDERING)
+        m_pParentDevice->GetContext();
+#endif
         m_pUnderlyingVideoProcess->ProcessFrames(&m_inputArguments, pBlit->NumSrcSurfaces, &m_outputArguments);
         m_inUseResources = decltype(m_inUseResources){};
     }
@@ -734,6 +740,9 @@ namespace D3D9on12
             ThrowFailure(E_INVALIDARG);
         }
 
+#if defined(D3D9ON12_BATCHED_RENDERING)
+        m_pParentDevice->GetContext();
+#endif
         m_pUnderlyingVideoProcess->ProcessFrames(&m_inputArguments, curStream, &m_outputArguments);
     }
 };

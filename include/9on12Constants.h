@@ -1,6 +1,9 @@
 ﻿// Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 #pragma once
+#if defined(_M_IX86) || defined(_M_X64)
+#include <emmintrin.h>
+#endif
 
 namespace D3D9on12
 {
@@ -37,8 +40,8 @@ namespace D3D9on12
 
     struct ConstantBufferBinding
     {
-        ConstantBufferBinding(UINT shaderRegister, Device& device) :
-            m_allocator(device, 1024*1024, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT),
+        ConstantBufferBinding(UINT shaderRegister, Device& device, UINT uploadBufferSize = 1024 * 1024) :
+            m_allocator(device, uploadBufferSize, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT),
             m_shaderRegister(shaderRegister){};
 
         void Version(const void* pData, UINT dataSize);
@@ -54,13 +57,21 @@ namespace D3D9on12
 
     class ConstantsManager
     {
+#if defined(D3D9ON12_FLOAT_CONSTANT_ARENA_8MIB)
+        // Float constants are versioned on nearly every draw; a larger arena means far
+        // fewer arena rollovers. Allocated lazily per stage.
+        static constexpr UINT g_cFloatConstantUploadBufferSize = 8 * 1024 * 1024;
+#else
+        static constexpr UINT g_cFloatConstantUploadBufferSize = 1024 * 1024;
+#endif
+
         struct ConstantBufferData
         {
-            ConstantBufferData(UINT SizePerElement, UINT NumElements, UINT shaderRegister, Device& device) :
+            ConstantBufferData(UINT SizePerElement, UINT NumElements, UINT shaderRegister, Device& device, UINT uploadBufferSize = 1024 * 1024) :
                 m_sizePerElement(SizePerElement),
                 m_lastCopySize(0),
-                m_dataDirty(false),
-                m_binding(shaderRegister, device)
+                m_firstDirtyByte(UINT_MAX),
+                m_binding(shaderRegister, device, uploadBufferSize)
             {
                 m_data.resize(m_sizePerElement * NumElements);
                 memset(m_data.data(), 0, m_data.size());
@@ -75,8 +86,28 @@ namespace D3D9on12
                 BYTE *pDest = m_data.data() + startOffset;
                 Check9on12(startOffset + copySize <= m_data.size());
 
-                memcpy(pDest, pData, copySize);
-                m_dataDirty = true;
+                // Preserve byte semantics (including NaNs and signed zero), while
+                // avoiding a new upload/descriptor when an app repeats constants.
+#if defined(_M_IX86) || defined(_M_X64)
+                if (copySize == 16)
+                {
+                    // A single float/int register is a common write. Keep its
+                    // byte comparison and copy inline, including NaN payloads.
+                    const auto incoming = _mm_loadu_si128(static_cast<const __m128i*>(pData));
+                    const auto previous = _mm_loadu_si128(reinterpret_cast<const __m128i*>(pDest));
+                    if (_mm_movemask_epi8(_mm_cmpeq_epi8(incoming, previous)) == 0xffff) return;
+                    _mm_storeu_si128(reinterpret_cast<__m128i*>(pDest), incoming);
+                }
+                else
+#endif
+                {
+                    if (copySize == 0 || memcmp(pDest, pData, copySize) == 0)
+                    {
+                        return;
+                    }
+                    memcpy(pDest, pData, copySize);
+                }
+                m_firstDirtyByte = min(m_firstDirtyByte, startOffset);
             }
 
             Result UpdateData(Device& /*device*/, UINT maxSet)
@@ -84,12 +115,12 @@ namespace D3D9on12
                 Result result = Result::S_SUCCESS;
                 // Even if the contents aren't dirty, we should update the data if 
                 // the maxSet has increased from the last binding
-                if (maxSet && (m_dataDirty || maxSet > m_lastCopySize))
+                if (maxSet && (m_firstDirtyByte < maxSet * m_sizePerElement || maxSet > m_lastCopySize))
                 {
                     UINT dataSize = min(maxSet * m_sizePerElement, static_cast<UINT>(m_data.size()));
                     m_binding.Version(m_data.data(), dataSize);
 
-                    m_dataDirty = false;
+                    m_firstDirtyByte = UINT_MAX;
                     m_lastCopySize = maxSet;
                     result = Result::S_CHANGE;
                 }
@@ -109,13 +140,16 @@ namespace D3D9on12
             const UINT m_sizePerElement;
             size_t m_lastCopySize;
 
-            bool m_dataDirty;
+            // Writes outside the shader's used prefix need no upload yet. Keep
+            // them pending until a later shader uses that range. Each version
+            // still copies its entire prefix into fresh, immutable storage.
+            UINT m_firstDirtyByte;
         };
 
         struct StageConstants
         {
             StageConstants(D3D12TranslationLayer::EShaderStage type, Device& device) :
-                m_floats(sizeof(Float4), max(MAX_VS_CONSTANTSF, MAX_PS_CONSTANTSF), ShaderConv::CB_FLOAT, device),
+                m_floats(sizeof(Float4), max(MAX_VS_CONSTANTSF, MAX_PS_CONSTANTSF), ShaderConv::CB_FLOAT, device, g_cFloatConstantUploadBufferSize),
                 m_integers(sizeof(Int4), max(MAX_VS_CONSTANTSI, MAX_PS_CONSTANTSI), ShaderConv::CB_INT, device),
                 m_booleans(sizeof(BOOL), max(MAX_VS_CONSTANTSB, MAX_PS_CONSTANTSB), ShaderConv::CB_BOOL, device),
                 m_shaderType(type){}
@@ -138,7 +172,7 @@ namespace D3D9on12
                 }
             }
 
-            void UpdateAppVisibleAndBindToPipeline(Device& device, UINT maxFloats, UINT maxInts, UINT maxBools);
+            void UpdateAppVisibleAndBindToPipeline(Device& device, UINT maxFloats, UINT maxInts, UINT maxBools, bool force = false);
             void NullOutBindings(Device& device, ConstantBufferBinding& nullCB);
 
         private:
@@ -183,7 +217,7 @@ namespace D3D9on12
             ConstantBufferBinding m_extension2;
             ConstantBufferBinding m_extension3;
 
-            bool m_dirty = true;
+            UINT m_dirty = 7;
         };
 
     public:
@@ -210,6 +244,7 @@ namespace D3D9on12
         Result UpdatePixelShaderExtension(const ShaderConv::eConstantBuffers extension, const void* pData, size_t dataSize);
 
         static void BindToPipeline(Device& device, ConstantBufferBinding& buffer, D3D12TranslationLayer::EShaderStage shaderStage);
+        static void BindToPipeline(Device& device, ConstantBufferBinding* const* buffers, UINT count, UINT dirtyMask, D3D12TranslationLayer::EShaderStage shaderStage);
 
         static const size_t g_cMaxConstantBufferSize = 256 * (sizeof(float) * 4); //256 float4 registers
     private:
