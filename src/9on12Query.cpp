@@ -1,4 +1,4 @@
-﻿// Copyright (c) Microsoft Corporation.
+// Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 #include "pch.h"
 
@@ -269,16 +269,20 @@ namespace D3D9on12
         if (m_pBatchedQuery)
         {
             device.CheckBatchError();
-            // D3D9 DoNotFlush semantics are preserved: the runtime's FLUSH flag arrives
-            // through the Flush DDI, polling must not drain the worker here.
-            bool ready = device.GetBatchedContext()->QueryGetData(m_pBatchedQuery.get(), data, size, true);
+            // The runtime doesn't pass D3DGETDATA_FLUSH to the driver (no Flush DDI call either), so an event query
+            // whose End is still in the batch being recorded would never complete when nothing else submits it: an
+            // application waiting on one (ReShade when it resets or destroys its runtime) hangs. Event queries
+            // submit that batch to the worker when polled (asynchronously: no drain, no wait), as D3DGETDATA_FLUSH
+            // would; Windows' D3D9On12 reports them done at once. Other queries keep not flushing.
+            bool doNotFlush = m_type != D3DDDIQUERYTYPE_EVENT;
+            bool ready = device.GetBatchedContext()->QueryGetData(m_pBatchedQuery.get(), data, size, doNotFlush);
             device.CheckBatchError();
             return ready;
         }
 #else
         UNREFERENCED_PARAMETER(device);
 #endif
-        return m_pUnderlyingQuery->GetData(data, size, true, false);
+        return m_pUnderlyingQuery->GetData(data, size, m_type != D3DDDIQUERYTYPE_EVENT, false);
     }
 
     HRESULT Query::GetData(Device& device, VOID* pData)

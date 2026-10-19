@@ -12,6 +12,9 @@
 // present interfaces). Reported only when the installed D3D12 runtime offers those interfaces;
 // clients can create a windowed device when exclusive presentation is unavailable.
 #define D3D9ON12_CAP_EXCLUSIVE_FULLSCREEN       (1u << 2)
+// ABI 2: event queries complete when polled (the batch holding their End is submitted), as D3DGETDATA_FLUSH asks;
+// drivers without it can leave an application that waits on one (ReShade on a reset) polling for ever.
+#define D3D9ON12_CAP_EVENT_QUERY_FLUSH          (1u << 3)
 #define D3D9ON12_CAPABILITIES_EXPORT "D3D9On12Capabilities"
 #define D3D9ON12_QUEUE_INTEROP_EXPORT "D3D9On12QueueInterop"
 

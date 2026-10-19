@@ -31,7 +31,7 @@ extern "C" uint32_t WINAPI D3D9On12Capabilities(uint32_t abiVersion)
     switch (abiVersion)
     {
     case 1u: return D3D9ON12_CAP_SAMPLER_ADDRESS_VALIDATION;
-    case 2u: return D3D9ON12_CAP_SAMPLER_ADDRESS_VALIDATION | D3D9ON12_CAP_QUEUED_INTEROP |
+    case 2u: return D3D9ON12_CAP_SAMPLER_ADDRESS_VALIDATION | D3D9ON12_CAP_QUEUED_INTEROP | D3D9ON12_CAP_EVENT_QUERY_FLUSH |
         (RuntimeOffersPrivatePresent() ? D3D9ON12_CAP_EXCLUSIVE_FULLSCREEN : 0u);
     default: return 0u;
     }
