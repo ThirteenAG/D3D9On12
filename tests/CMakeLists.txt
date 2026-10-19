@@ -29,3 +29,6 @@ target_link_libraries(d3d9on12_latency_probe PRIVATE user32 d3d12)
 
 add_executable(d3d9on12_allocation_info_probe allocation_info_probe.cpp)
 target_link_libraries(d3d9on12_allocation_info_probe PRIVATE d3d12)
+
+add_executable(d3d9on12_hdr_output_probe hdr_output_probe.cpp)
+target_link_libraries(d3d9on12_hdr_output_probe PRIVATE user32 d3dcompiler d3d12)

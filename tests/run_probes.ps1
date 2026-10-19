@@ -36,6 +36,7 @@ $cases = @(
     @('allocation_info'),
     @('latency', '--native'), @('latency'), @('latency', '--debug'),
     @('runtime', '--require-local', '--require-extensions', '--reset'),
+    @('hdr_output'),
     @('sampler'), @('sampler', '--debug', '--zero-address'),
     @('sampler', '--debug', '--binding-runs'),
     @('sampler', '--large-upload-offsets'), @('sampler', '--debug', '--large-upload-offsets'),

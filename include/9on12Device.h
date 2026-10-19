@@ -43,6 +43,8 @@ namespace D3D9on12
         static void RegisterDevice(Device* pDevice);
         static void UnregisterDevice(Device* pDevice);
         static Device* FindDeviceForD3D12Device(ID3D12Device* pD3D12Device);
+        // Calls fn for every registered device with the registry locked (devices are neither created nor destroyed meanwhile)
+        static void ForEachRegisteredDevice(const std::function<void(Device&)>& fn);
         void RegisterInteropResource(Resource* pResource);
         void UnregisterInteropResource(Resource* pResource);
         HRESULT QueueInterop(const D3D9ON12_INTEROP_REQUEST& request, uint32_t* pToken);
@@ -56,6 +58,8 @@ namespace D3D9on12
         static FORCEINLINE HANDLE GetHandleFromDevice(Device* pDevice){ return static_cast<HANDLE>(pDevice); }
         static FORCEINLINE Device* GetDeviceFromHandle(HANDLE hDevice){ return static_cast<Device*>(hDevice); }
         std::shared_ptr<D3D12TranslationLayer::SwapChainManager> GetSwapChainManager();
+        // The window of a swap chain of a windowed present stays the runtime's: no DXGI Alt+Enter or window changes
+        void LeaveWindowToRuntime(IDXGISwapChain3* pSwapChain, HWND hWindow);
         // Presenting primaries (exclusive fullscreen) through the D3D12 runtime's private present interfaces
         // (9on12PrivatePresent.h) when the D3D9 runtime offers no present callback. False when the runtime
         // lacks the interfaces; primaries are then refused at creation so fullscreen devices fail cleanly.
@@ -64,6 +68,17 @@ namespace D3D9on12
         // longer than a bounded time without progress (the runtime refuses DONOTWAIT presents while it is true).
         bool IsPresentLatencyReached();
         HRESULT PrivatePresent(Resource* pSource, UINT subresource, D3DKMT_PRESENT* pKMTArgs);
+
+        // HDR output (D3D9On12SetHdrOutput / D3D9On12QueryHdrOutput, include/D3D9On12Extensions.h,
+        // src/9on12HdrOutput.cpp). A null device sets the process default and every registered device.
+        static HRESULT SetHdrOutput(ID3D12Device* pD3D12Device, const D3D9ON12_HDR_OUTPUT& output);
+        static HRESULT QueryHdrOutput(ID3D12Device* pD3D12Device, HWND window, D3D9ON12_HDR_OUTPUT_STATUS& status);
+        // At resource creation: whether this is a swap chain buffer of the runtime that is stored as float
+        bool StoreSwapChainBufferAsFloat(const D3DDDIARG_CREATERESOURCE2& createArgs);
+        // At a windowed present: the color space and metadata of the window's swap chain for the presented buffer
+        void ApplyHdrToSwapChain(IDXGISwapChain3* pSwapChain, Resource& source);
+        // At an exclusive fullscreen present
+        void NoteExclusivePresent();
 
         ConstantsManager &GetConstantsManager() { return m_constantsManager; }
 
@@ -274,9 +289,24 @@ namespace D3D9on12
 
         std::mutex m_SwapChainManagerMutex;
         std::shared_ptr<D3D12TranslationLayer::SwapChainManager> m_SwapChainManager;
+        IDXGISwapChain3* m_pWindowAssociatedSwapChain = nullptr;   // identity only (LeaveWindowToRuntime)
         CComPtr<ID3D12CommandQueuePrivatePresent> m_pPrivateQueuePresent;
         int m_privatePresentState = 0; // 0 unknown, 1 available, 2 unavailable
         LONGLONG m_latencyReachedSinceQpc = 0;
+
+        // HDR output, under m_hdrLock: the description, its version (bumped by each set), the swap chain buffers
+        // created last (float, displayable) and what the window's swap chain was last given
+        void InitHdrOutput();
+        std::mutex m_hdrLock;
+        D3D9ON12_HDR_OUTPUT m_hdrOutput = {};
+        UINT m_hdrVersion = 0;
+        bool m_hdrFloatBuffers = false;
+        bool m_hdrExclusiveBuffers = false;
+        bool m_hdrActive = false;
+        IDXGISwapChain3* m_pHdrSwapChain = nullptr;     // identity only, owned by the swap chain manager
+        DXGI_SWAP_CHAIN_DESC1 m_hdrSwapChainDesc = {};
+        DXGI_COLOR_SPACE_TYPE m_hdrColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+        UINT m_hdrAppliedVersion = 0;
 
         CComPtr<ID3DBlob> m_pSerializedLayout;
     

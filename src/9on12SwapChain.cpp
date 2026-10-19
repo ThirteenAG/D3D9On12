@@ -147,10 +147,15 @@ namespace D3D9on12
             else
             {
                 // Fallback to old present path
-                if (pSource->GetVidPnSourceId() != D3DDDI_ID_UNINITIALIZED || pKMTArgs->hWindow == nullptr)
+                // A primary or the runtime's displayable buffer flipped without a destination (exclusive fullscreen):
+                // the kernel flip goes through the D3D12 runtime's private present interfaces. hWindow alone doesn't
+                // tell: after a Reset from a window the runtime keeps passing the device window with the exclusive
+                // buffers, and presenting those through a DXGI swap chain on that window never completes (every frame
+                // waited out the latency gate, the game's device stayed lost).
+                if (pSource->GetVidPnSourceId() != D3DDDI_ID_UNINITIALIZED || pKMTArgs->hWindow == nullptr ||
+                    (pSource->IsDisplayableSurface() && !pDest))
                 {
-                    // A primary (exclusive fullscreen): no window to attach a swap chain to; the kernel flip
-                    // goes through the D3D12 runtime's private present interfaces.
+                    NoteExclusivePresent();
                     hr = PrivatePresent(pSource, presentSurfaces[0].SubResourceIndex, pKMTArgs);
                 }
                 else
@@ -159,6 +164,8 @@ namespace D3D9on12
                     D3D12TranslationLayer::Resource* pSrcTranslationLayerResource = pSource->GetUnderlyingResource();
 
                     auto pSwapChain = swapChainManager->GetSwapChainForWindow(pKMTArgs->hWindow, *pSrcTranslationLayerResource);
+                    LeaveWindowToRuntime(pSwapChain, pKMTArgs->hWindow);
+                    ApplyHdrToSwapChain(pSwapChain, *pSource);
                     auto swapChainHelper = D3D12TranslationLayer::SwapChainHelper(pSwapChain);
                     GetContext().m_MaxFrameLatencyHelper.WaitForMaximumFrameLatency();
 
@@ -286,6 +293,25 @@ namespace D3D9on12
         }
         m_latencyReachedSinceQpc = 0;
         return false;
+    }
+
+    // DXGI watches the window of a swap chain for Alt+Enter and window changes and switches the swap chain to its own
+    // fullscreen state. The window and its fullscreen state belong to the D3D9 runtime and the application: a real
+    // Alt+Enter on a window that had a windowed present made DXGI take the output, and the runtime's following Reset to
+    // exclusive fullscreen failed with D3DERR_DEVICELOST (the application's own Alt+Enter handling, e.g. a game's, never
+    // went back to fullscreen). Once per swap chain.
+    void Device::LeaveWindowToRuntime(IDXGISwapChain3* pSwapChain, HWND hWindow)
+    {
+        if (!pSwapChain || pSwapChain == m_pWindowAssociatedSwapChain)
+        {
+            return;
+        }
+        m_pWindowAssociatedSwapChain = pSwapChain;
+        CComPtr<IDXGIFactory1> pFactory;
+        if (SUCCEEDED(pSwapChain->GetParent(IID_PPV_ARGS(&pFactory))))
+        {
+            pFactory->MakeWindowAssociation(hWindow, DXGI_MWA_NO_WINDOW_CHANGES | DXGI_MWA_NO_ALT_ENTER);
+        }
     }
 
     std::shared_ptr<D3D12TranslationLayer::SwapChainManager> Device::GetSwapChainManager()

@@ -854,7 +854,15 @@ namespace D3D9on12
             m_dx9Format = D3DFMT_A8R8G8B8;
             m_DisableAlphaChannel = true;
         }
+        // HDR output (9on12HdrOutput.cpp): the runtime's swap chain buffers of a device with HDR output enabled are
+        // stored as 16-bit float; the runtime and the application keep their 8-bit format
+        if (!onlyFirstSurfInitialized && !pAlreadyCreatedResource && m_pParentDevice->StoreSwapChainBufferAsFloat(createArgs))
+        {
+            m_DisableAlphaChannel = m_DisableAlphaChannel || m_dx9Format == D3DFMT_X8R8G8B8;
+            m_dx9Format = D3DFMT_A16B16G16R16F;
+        }
         m_VidPnSourceId = bIsDisplayable ? createArgs.VidPnSourceId : D3DDDI_ID_UNINITIALIZED;
+        m_IsDisplayableSurface = bIsDisplayable || createArgs.Flags2.IsDisplayable;
 
         m_ViewFormat = ConvertToDXGIFORMAT(m_dx9Format);
         m_IsLockable = IsLockable(m_dx9Format) && !createArgs.Flags.NotLockable;

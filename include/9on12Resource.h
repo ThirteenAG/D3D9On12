@@ -240,6 +240,9 @@ namespace D3D9on12
 
         D3D12_SHADER_RESOURCE_VIEW_DESC GetShaderResourceViewDescForArraySlice(UINT8 arraySlice, UINT8 arraySize);
         UINT GetVidPnSourceId() const { return m_VidPnSourceId; }
+        // A buffer the runtime can scan out: a primary, or a displayable shared texture (the runtime's exclusive
+        // fullscreen swap chain buffers)
+        bool IsDisplayableSurface() const { return m_IsDisplayableSurface; }
 
     protected:
         virtual void CreateUnderlyingResource( D3D12TranslationLayer::ResourceCreationArgs& underlyingResourceCreateArgs, _Inout_ D3DDDIARG_CREATERESOURCE2& createArgs );
@@ -309,6 +312,7 @@ namespace D3D9on12
         D3D12_RESOURCE_DESC m_logicalDesc;
         UINT m_CpuAccessFlags;
         UINT m_VidPnSourceId;
+        bool m_IsDisplayableSurface = false;
 
         D3D12TranslationLayer::ResourceCreationArgs m_TranslationLayerCreateArgs;
 

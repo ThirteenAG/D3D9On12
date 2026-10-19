@@ -49,6 +49,15 @@ namespace D3D9on12
     }
 
 
+    void Device::ForEachRegisteredDevice(const std::function<void(Device&)>& fn)
+    {
+        std::lock_guard<std::mutex> lock(g_deviceRegistryLock);
+        for (Device* pDevice : g_deviceRegistry)
+        {
+            fn(*pDevice);
+        }
+    }
+
     Device* Device::FindDeviceForD3D12Device(ID3D12Device* pD3D12Device)
     {
         if (!pD3D12Device)

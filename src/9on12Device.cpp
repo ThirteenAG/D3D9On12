@@ -493,6 +493,7 @@ namespace D3D9on12
         m_pDevice = pDevice;
         m_pCommandQueue = pCommandQueue;
         RegisterDevice(this);
+        InitHdrOutput();
 
         D3D12_FEATURE_DATA_D3D12_OPTIONS FeatureDataD3D12 = {};
         D3D12TranslationLayer::TranslationLayerCallbacks Callbacks{};

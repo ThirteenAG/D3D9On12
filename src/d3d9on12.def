@@ -5,3 +5,5 @@ EXPORTS
     SetAppCompatData
     D3D9On12Capabilities
     D3D9On12QueueInterop
+    D3D9On12SetHdrOutput
+    D3D9On12QueryHdrOutput
