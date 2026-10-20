@@ -58,6 +58,7 @@ namespace D3D9on12
         static FORCEINLINE HANDLE GetHandleFromDevice(Device* pDevice){ return static_cast<HANDLE>(pDevice); }
         static FORCEINLINE Device* GetDeviceFromHandle(HANDLE hDevice){ return static_cast<Device*>(hDevice); }
         std::shared_ptr<D3D12TranslationLayer::SwapChainManager> GetSwapChainManager();
+        void ReleaseWindowSwapChains(Resource* presentingResource = nullptr);
         // The window of a swap chain of a windowed present stays the runtime's: no DXGI Alt+Enter or window changes
         void LeaveWindowToRuntime(IDXGISwapChain3* pSwapChain, HWND hWindow);
         // Presenting primaries (exclusive fullscreen) through the D3D12 runtime's private present interfaces
@@ -289,6 +290,7 @@ namespace D3D9on12
 
         std::mutex m_SwapChainManagerMutex;
         std::shared_ptr<D3D12TranslationLayer::SwapChainManager> m_SwapChainManager;
+        Resource* m_pWindowPresentSource = nullptr; // identity only, cleared before the resource is destroyed
         IDXGISwapChain3* m_pWindowAssociatedSwapChain = nullptr;   // identity only (LeaveWindowToRuntime)
         CComPtr<ID3D12CommandQueuePrivatePresent> m_pPrivateQueuePresent;
         int m_privatePresentState = 0; // 0 unknown, 1 available, 2 unavailable

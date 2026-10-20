@@ -1,6 +1,7 @@
 ﻿// Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 #include "pch.h"
+#include <DirectXPackedVector.h>
 
 namespace D3D9on12
 {    
@@ -334,12 +335,14 @@ namespace D3D9on12
             {
                 const DXGI_FORMAT SrcFormat = args.m_source.GetLogicalDesc().Format;
                 UINT8 BytesPerPixel = (SrcFormat == DXGI_FORMAT_UNKNOWN) ? 1 : GetBytesPerUnit(SrcFormat);
+                const DXGI_FORMAT DstFormat = destination.GetLogicalDesc().Format;
+                UINT8 DstBytesPerPixel = (DstFormat == DXGI_FORMAT_UNKNOWN) ? 1 : GetBytesPerUnit(DstFormat);
 
                 // Offset destination
                 reinterpret_cast<BYTE*&>(appDstData.pData) +=
                     (args.m_destinationZ * appDstData.SlicePitch) +
                     (args.m_destinationY * appDstData.RowPitch) +
-                    (args.m_destinationX * BytesPerPixel);
+                    (args.m_destinationX * DstBytesPerPixel);
 
                 // Offset source
                 reinterpret_cast<BYTE*&>(srcData.pData) +=
@@ -352,7 +355,40 @@ namespace D3D9on12
                 NumRows = args.m_sourceBox.bottom - args.m_sourceBox.top;
             }
 
-            MemcpySubresource(&appDstData, &srcSubresourceData, BytesPerRow, NumRows, 1);
+            const auto dstFormat = destination.GetD3DFormat();
+            const bool bgra = dstFormat == D3DFMT_A8R8G8B8 || dstFormat == D3DFMT_X8R8G8B8;
+            const bool rgba = dstFormat == D3DFMT_A8B8G8R8 || dstFormat == D3DFMT_X8B8G8R8;
+            if (source.GetD3DFormat() == D3DFMT_A16B16G16R16F && (bgra || rgba))
+            {
+                // HDR buffers keep the runtime's 8-bit format but contain float pixels. Readback
+                // must convert them to the application's layout, just as a GPU blit does.
+                const bool opaque = dstFormat == D3DFMT_X8R8G8B8 || dstFormat == D3DFMT_X8B8G8R8;
+                auto src = static_cast<const BYTE*>(srcSubresourceData.pData);
+                auto dst = static_cast<BYTE*>(destination.m_appLinearRepresentation.m_systemData[destinationSubresourceIndex].pData);
+                UINT width = source.GetSubresourceFootprint(sourceSubresourceIndex).Footprint.Width;
+                if (!args.m_dimensionsCoverEntireResource)
+                {
+                    src += args.m_sourceBox.front * srcData.DepthPitch + args.m_sourceBox.top * srcData.RowPitch + args.m_sourceBox.left * 8;
+                    dst += args.m_destinationZ * appDstData.SlicePitch + args.m_destinationY * appDstData.RowPitch + args.m_destinationX * 4;
+                    width = args.m_sourceBox.right - args.m_sourceBox.left;
+                }
+                for (UINT y = 0; y < NumRows; ++y)
+                {
+                    auto row = reinterpret_cast<const DirectX::PackedVector::XMHALF4*>(src + y * srcData.RowPitch);
+                    auto output = reinterpret_cast<DirectX::PackedVector::XMUBYTEN4*>(dst + y * appDstData.RowPitch);
+                    for (UINT x = 0; x < width; ++x)
+                    {
+                        auto color = DirectX::PackedVector::XMLoadHalf4(row + x);
+                        if (bgra)
+                            color = DirectX::XMVectorSwizzle<2, 1, 0, 3>(color);
+                        if (opaque)
+                            color = DirectX::XMVectorSetW(color, 1.0f);
+                        DirectX::PackedVector::XMStoreUByteN4(output + x, color);
+                    }
+                }
+            }
+            else
+                MemcpySubresource(&appDstData, &srcSubresourceData, BytesPerRow, NumRows, 1);
 
             context.Unmap(pMappableResource, sourceSubresourceIndex, D3D12TranslationLayer::MAP_TYPE_READ, nullptr);
 

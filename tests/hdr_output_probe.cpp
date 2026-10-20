@@ -86,7 +86,7 @@ int main(int argc, char** argv)
     const bool fullscreen = fullscreenAdapter >= 0;
     D3DDISPLAYMODE mode{};
     d3d->GetAdapterDisplayMode(fullscreen ? fullscreenAdapter : 0, &mode);
-    const UINT width = fullscreen ? mode.Width : 640, height = fullscreen ? mode.Height : 360;
+    const UINT width = fullscreen ? mode.Width : 641, height = fullscreen ? mode.Height : 359;
     HWND window = CreateWindowW(L"STATIC", L"D3D9On12 HDR output probe", WS_POPUP | WS_VISIBLE, windowX, windowY, width, height,
         nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
 
@@ -155,6 +155,36 @@ int main(int argc, char** argv)
                 readback->UnlockRect();
             }
         }
+        // The runtime still reports the original 8-bit format. Its ordinary screenshot path
+        // must receive converted pixels, rather than the first four bytes of each float pixel.
+        ComPtr<IDirect3DSurface9> readback8;
+        D3DSURFACE_DESC backBufferDesc{};
+        backBuffer->GetDesc(&backBufferDesc);
+        if (backBufferDesc.Format == D3DFMT_A8R8G8B8 || backBufferDesc.Format == D3DFMT_X8R8G8B8)
+        {
+            Check(SUCCEEDED(device->CreateOffscreenPlainSurface(backBufferDesc.Width, backBufferDesc.Height, backBufferDesc.Format,
+                D3DPOOL_SYSTEMMEM, &readback8, nullptr)), "8-bit readback surface");
+            if (readback8)
+            {
+                Check(SUCCEEDED(device->GetRenderTargetData(backBuffer.Get(), readback8.Get())), "8-bit readback copy");
+                D3DLOCKED_RECT locked{};
+                if (SUCCEEDED(readback8->LockRect(&locked, nullptr, D3DLOCK_READONLY)))
+                {
+                    auto pixel8 = static_cast<const BYTE*>(locked.pBits) + locked.Pitch * (height / 2) + 4 * (width / 2);
+                    bool correct = true;
+                    for (int c = 0; c < 4; ++c)
+                    {
+                        const int channel = c < 3 ? 2 - c : c;
+                        const int expected = static_cast<int>(std::lround(std::fmin(std::fmax(constants[channel], 0.0f), 1.0f) * 255.0f));
+                        correct = correct && std::abs(static_cast<int>(pixel8[c]) - expected) <= 1;
+                    }
+                    Check(correct, "8-bit readback converts float channels");
+                    readback8->UnlockRect();
+                }
+                else
+                    Check(false, "8-bit readback lock");
+            }
+        }
         HRESULT present = device->Present(nullptr, nullptr, nullptr, nullptr);
         if (placed || fullscreen)
             Sleep(3000);
@@ -210,6 +240,48 @@ int main(int argc, char** argv)
     queryHdr(d3d12.Get(), nullptr, &deviceStatus);
     if (!fullscreen)
         Check((deviceStatus.Flags & D3D9ON12_HDR_STATUS_ACTIVE) && std::fabs(pixel[0] - 2.0f) < 0.01f, "on again: scRGB, 2.0 kept");
+
+    for (int recovery = 0; !fullscreen && recovery < 2; ++recovery)
+    {
+        // Recovery can overlap old and new devices, after Reset alone or an exclusive present.
+        // Neither path may leave the old window swap chain claiming the replacement's HWND.
+        if (recovery)
+        {
+            D3DDISPLAYMODE desktop{};
+            d3d->GetAdapterDisplayMode(0, &desktop);
+            D3DPRESENT_PARAMETERS exclusive = pp;
+            exclusive.Windowed = FALSE;
+            exclusive.BackBufferWidth = desktop.Width;
+            exclusive.BackBufferHeight = desktop.Height;
+            exclusive.BackBufferFormat = desktop.Format;
+            exclusive.FullScreen_RefreshRateInHz = desktop.RefreshRate;
+            Check(SUCCEEDED(device->Reset(&exclusive)), "recovery: Reset exclusive");
+            Check(SUCCEEDED(frame(0.25f, pixel)), "recovery: exclusive Present");
+        }
+        Check(SUCCEEDED(device->Reset(&pp)), "recovery: Reset windowed without presenting");
+        ComPtr<IDirect3DDevice9> previousDevice = device;
+        device.Reset();
+        Check(SUCCEEDED(setHdr(nullptr, &output)), "recovery: HDR default enabled");
+        hr = d3d->CreateDevice(0, D3DDEVTYPE_HAL, window, D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &device);
+        Check(SUCCEEDED(hr), "recovery: replacement CreateDevice while previous device lives");
+        if (SUCCEEDED(hr))
+        {
+            shader.Reset();
+            device->CreatePixelShader(static_cast<const DWORD*>(code->GetBufferPointer()), &shader);
+            on12.Reset();
+            d3d12.Reset();
+            device.As(&on12);
+            on12->GetD3D12Device(IID_PPV_ARGS(&d3d12));
+            hr = frame(2.0f, pixel);
+            Check(SUCCEEDED(hr), "recovery: replacement window Present");
+            previousDevice.Reset();
+            queryHdr(d3d12.Get(), nullptr, &deviceStatus);
+            std::printf("recovery flags=0x%X colorspace=%u pixel=%.3f %.3f %.3f %.3f\n", deviceStatus.Flags,
+                deviceStatus.ColorSpace, pixel[0], pixel[1], pixel[2], pixel[3]);
+            Check((deviceStatus.Flags & D3D9ON12_HDR_STATUS_ACTIVE) && std::fabs(pixel[0] - 2.0f) < 0.01f,
+                "recovery: replacement presents scRGB with highlights");
+        }
+    }
 
     // HDR output off for later devices of the process
     output.Flags = 0;

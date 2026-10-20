@@ -272,6 +272,7 @@ namespace D3D9on12
 
     void Device::NoteExclusivePresent()
     {
+        ReleaseWindowSwapChains();
         std::lock_guard<std::mutex> lock(m_hdrLock);
         m_hdrActive = false;
         // A window swap chain made later is a new one

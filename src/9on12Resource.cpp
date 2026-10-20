@@ -349,6 +349,7 @@ namespace D3D9on12
         }
 
         HRESULT hr = S_OK;
+        pDevice->ReleaseWindowSwapChains(pResource);
         delete pResource;
         
         D3D9on12_DDI_ENTRYPOINT_END_AND_RETURN_HR(hr);

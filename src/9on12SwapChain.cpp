@@ -160,6 +160,7 @@ namespace D3D9on12
                 }
                 else
                 {
+                    m_pWindowPresentSource = Resource::GetResourceFromHandle(PresentArgs.phSrcResources[0].hResource);
                     auto swapChainManager = GetSwapChainManager();
                     D3D12TranslationLayer::Resource* pSrcTranslationLayerResource = pSource->GetUnderlyingResource();
 
@@ -312,6 +313,28 @@ namespace D3D9on12
         {
             pFactory->MakeWindowAssociation(hWindow, DXGI_MWA_NO_WINDOW_CHANGES | DXGI_MWA_NO_ALT_ENTER);
         }
+    }
+
+    void Device::ReleaseWindowSwapChains(Resource* presentingResource)
+    {
+        std::lock_guard<std::mutex> lock(m_SwapChainManagerMutex);
+        if (presentingResource && presentingResource != m_pWindowPresentSource)
+        {
+            return;
+        }
+        // Reset can replace the driver device before the old one is released. The old HWND's flip
+        // chain must retire with its presenting buffers, rather than keeping the replacement out.
+        if (m_SwapChainManager)
+        {
+            GetContextForDestruction();
+            m_SwapChainManager.reset();
+            GetContextNoDrain().TrimDeletedObjects();
+        }
+        m_pWindowPresentSource = nullptr;
+        m_pWindowAssociatedSwapChain = nullptr;
+        std::lock_guard<std::mutex> hdrLock(m_hdrLock);
+        m_pHdrSwapChain = nullptr;
+        m_hdrActive = false;
     }
 
     std::shared_ptr<D3D12TranslationLayer::SwapChainManager> Device::GetSwapChainManager()
