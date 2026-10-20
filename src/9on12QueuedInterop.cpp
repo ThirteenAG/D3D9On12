@@ -248,8 +248,15 @@ namespace D3D9on12
         {
             CheckBatchError();
             QueuedInteropExtension::Payload payload = { this, request.get() };
+            const bool isExport = request->m_operation == D3D9ON12_INTEROP_EXPORT_COPY;
             pBatch->BatchExtension(&g_queuedInteropExtension, &payload, sizeof(payload));
             request.release(); // owned by the recorded command until it is dispatched
+            if (isExport)
+            {
+                // The other party waits for the export's fence signal: hand the batch to the worker now instead of
+                // when the application's next flush or a full batch submits it
+                pBatch->SubmitBatch();
+            }
             return true;
         }
 #endif
